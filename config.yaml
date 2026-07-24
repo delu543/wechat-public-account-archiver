@@ -1,0 +1,38 @@
+database:
+  path: "~/Library/Application Support/WeChatPublicAccountArchive/data/archive.sqlite"
+
+output:
+  path: "~/Library/Application Support/WeChatPublicAccountArchive/output"
+
+web:
+  host: 127.0.0.1
+  port: 8765
+
+automation:
+  enabled: true
+  weekday: 6
+  hour: 20
+  minute: 0
+  check_interval_seconds: 60
+  prepare_wechat_session: true
+  session_retry_hours: 12
+
+fetch:
+  timeout_seconds: 20
+  min_delay_seconds: 2.0
+  max_delay_seconds: 5.0
+  max_retries: 2
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+discoverers:
+  url:
+    enabled: true
+  search:
+    enabled: false
+    max_results_per_clue: 10
+    min_delay_seconds: 2.0
+    max_delay_seconds: 5.0
+  browser:
+    enabled: false
+  official_api:
+    enabled: false

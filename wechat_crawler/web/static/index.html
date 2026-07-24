@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>微信公众号归档</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="app-header">
+        <div>
+          <h1>微信公众号归档</h1>
+          <p id="databasePath" class="database-path">正在读取本地存储位置</p>
+        </div>
+        <div class="header-actions">
+          <button id="openOutputBtn" type="button" class="secondary header-button">打开输出目录</button>
+          <span id="schedulerBadge" class="status-badge neutral">正在读取</span>
+        </div>
+      </header>
+
+      <section class="command-band" aria-label="归档设置">
+        <form id="jobForm" class="capture-form">
+          <label class="field wide" for="urlInput">
+            <span>公开文章链接</span>
+            <input id="urlInput" type="url" placeholder="https://mp.weixin.qq.com/s/..." autocomplete="off" required />
+          </label>
+          <label class="field" for="sinceDateInput">
+            <span>起始日期</span>
+            <input id="sinceDateInput" type="date" />
+          </label>
+          <button type="submit">添加并抓取</button>
+        </form>
+        <form id="scheduleForm" class="schedule-form">
+          <label class="field" for="scheduleWeekday">
+            <span>每周运行</span>
+            <select id="scheduleWeekday">
+              <option value="0">周一</option>
+              <option value="1">周二</option>
+              <option value="2">周三</option>
+              <option value="3">周四</option>
+              <option value="4">周五</option>
+              <option value="5">周六</option>
+              <option value="6">周日</option>
+            </select>
+          </label>
+          <label class="field compact" for="scheduleTime">
+            <span>时间</span>
+            <input id="scheduleTime" type="time" value="20:00" />
+          </label>
+          <button type="submit" class="secondary">保存计划</button>
+        </form>
+      </section>
+
+      <section class="metric-strip" aria-label="自动归档概览">
+        <div class="metric"><span>订阅</span><strong id="subscriptionMetric">--</strong></div>
+        <div class="metric"><span>待输出</span><strong id="pendingMetric">--</strong></div>
+        <div class="metric"><span>下次运行</span><strong id="nextRunMetric">--</strong></div>
+        <div class="metric"><span>可清理</span><strong id="cleanupMetric">--</strong></div>
+      </section>
+
+      <section class="automation-grid" aria-label="自动归档控制台">
+        <section class="subscription-panel">
+          <div class="section-heading">
+            <div>
+              <h2>公众号订阅</h2>
+              <p>按账号独立归档</p>
+            </div>
+            <button id="cleanupBtn" type="button" class="secondary">清理可回收数据</button>
+          </div>
+          <div class="table-wrap">
+            <table class="subscription-table">
+              <thead>
+                <tr>
+                  <th>公众号</th>
+                  <th>归档</th>
+                  <th>最新文章</th>
+                  <th>待输出</th>
+                  <th>下次运行</th>
+                  <th class="actions-column">操作</th>
+                </tr>
+              </thead>
+              <tbody id="subscriptionsBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <aside class="execution-panel">
+          <div class="section-heading compact-heading">
+            <div>
+              <h2>当前任务</h2>
+              <p id="jobPhase">暂无运行任务</p>
+            </div>
+            <span id="etaText" class="eta">--</span>
+          </div>
+          <p id="jobMessage" class="job-message">等待计划运行</p>
+          <div class="progress-track"><div id="progressFill" class="progress-fill" style="width: 0%"></div></div>
+          <div class="progress-meta">
+            <span id="progressText">0%</span>
+            <span id="jobCounts">发现 0 · 保存 0 · 失败 0</span>
+          </div>
+          <div class="progress-meta progress-detail">
+            <span id="workflowMode">模式：--</span>
+            <span id="unresolvedCounts">未解决：--</span>
+          </div>
+          <div id="sessionPanel" class="session-panel" hidden>
+            <strong>需要刷新微信会话</strong>
+            <p id="sessionAction"></p>
+            <ol id="sessionSteps"></ol>
+          </div>
+          <div class="exports-block">
+            <h3>最近 Word</h3>
+            <div id="exportsList" class="exports-list"></div>
+          </div>
+        </aside>
+      </section>
+
+      <section class="library" aria-label="文章库">
+        <div class="library-heading">
+          <div>
+            <h2>文章库</h2>
+            <p>公众号文件夹</p>
+          </div>
+          <button id="refreshBtn" type="button" class="secondary">刷新</button>
+        </div>
+        <div class="workspace">
+          <aside class="accounts-pane" aria-label="公众号文件夹">
+            <div id="accountsList" class="folder-list"></div>
+          </aside>
+          <section class="content-pane" aria-label="文章内容">
+            <div id="accountHeader" class="account-header">
+              <h2>选择公众号</h2>
+              <p>文章列表将在此处加载</p>
+            </div>
+            <div class="split-view">
+              <div class="article-column">
+                <div id="articlesList" class="article-list"></div>
+                <button id="loadMoreBtn" class="load-more secondary" type="button" hidden>加载更多</button>
+              </div>
+              <article class="reader">
+                <header>
+                  <h2 id="articleTitle">未选择文章</h2>
+                  <div id="articleMeta" class="article-meta"></div>
+                </header>
+                <pre id="articleBody" class="article-body">选择文章后显示正文。</pre>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
