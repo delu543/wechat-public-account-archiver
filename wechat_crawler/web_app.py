@@ -19,6 +19,7 @@ from .automation_store import AutomationStore
 from .cleanup import ArchiveCleanup
 from .crawler.date_range import article_in_range, extract_publish_date, normalize_date, publish_timestamp_to_date
 from .crawler.discoverers import WechatHistoryDiscoverer
+from .crawler.discoverers.wechat_cache_discoverer import WechatCacheDiscoverer
 from .crawler.discoverers.history_discoverer import (
     HistoryDiscoveryError,
     SESSION_RECOVERY_STEPS,
@@ -603,7 +604,22 @@ class ArchiveWebService:
                     automation_cfg = self.config.get("automation", {})
                     if job.status != "needs_session" or not automation_cfg.get("prepare_wechat_session", False):
                         return
-                    preparation = WechatSessionRefresher().prepare_account(article.account_name)
+                    history_cfg = self.config.get("history", {})
+                    session_cache = WechatCacheDiscoverer(
+                        history_cfg.get(
+                            "app_data_dir",
+                            "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data",
+                        ),
+                        target_biz=article.account_id,
+                        target_wechat_id=article.wechat_id,
+                    )
+                    preparation = WechatSessionRefresher().prepare_account(
+                        article.account_name,
+                        session_fingerprint=session_cache.session_fingerprint,
+                        session_timeout_seconds=float(
+                            automation_cfg.get("session_ready_timeout_seconds", 15.0)
+                        ),
+                    )
                     if not preparation.article_open_attempted:
                         job.message = f"{job.message}\n自动微信恢复失败：{preparation.message}"
                         return

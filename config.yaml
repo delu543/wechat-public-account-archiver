@@ -15,6 +15,7 @@ automation:
   minute: 0
   check_interval_seconds: 60
   prepare_wechat_session: true
+  session_ready_timeout_seconds: 15
   session_retry_hours: 12
 
 fetch:

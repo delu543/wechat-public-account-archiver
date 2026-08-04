@@ -190,3 +190,28 @@ def test_wechat_cache_session_scan_reads_newest_chromium_http_cache(tmp_path):
     assert len(items) == 1
     assert items[0].source_file == str(signed)
     assert "key=http-cache-session" in items[0].fetch_url
+
+
+def test_session_fingerprint_is_opaque_and_changes_with_exact_account_session(tmp_path):
+    cache = tmp_path / "Share Data"
+    cache.write_text(
+        "https://mp.weixin.qq.com/s?__biz=MzExampleAccount==&mid=2647931001&idx=1"
+        "&sn=first&uin=123&key=first-session",
+        encoding="utf-8",
+    )
+    discoverer = WechatCacheDiscoverer(tmp_path, target_biz="MzExampleAccount==")
+
+    first = discoverer.session_fingerprint()
+    assert first
+    assert "first-session" not in first
+
+    cache.write_text(
+        "https://mp.weixin.qq.com/s?__biz=MzExampleAccount==&mid=2647931002&idx=1"
+        "&sn=second&uin=123&key=second-session",
+        encoding="utf-8",
+    )
+    second = discoverer.session_fingerprint()
+
+    assert second
+    assert second != first
+    assert "second-session" not in second
