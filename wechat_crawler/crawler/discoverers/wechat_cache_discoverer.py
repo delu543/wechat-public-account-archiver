@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import html
 import re
 import signal
@@ -91,6 +92,24 @@ class WechatCacheDiscoverer:
             if stop_when_session_fields and self._has_session_candidate(candidates):
                 break
         return sorted(candidates.values(), key=lambda item: (int(item.mid or 0), int(item.idx or 0)), reverse=True)
+
+    def session_fingerprint(self) -> str | None:
+        """Return an opaque fingerprint for the current exact-account session.
+
+        The signed URL is used only in memory and is never returned or logged.
+        A changed fingerprint means WeChat wrote a newly loaded article session.
+        """
+        signed_urls: list[str] = []
+        for candidate in self.discover(stop_when_session_fields=True):
+            if not candidate.fetch_url:
+                continue
+            params = dict(parse_qsl(urlparse(candidate.fetch_url).query, keep_blank_values=True))
+            if params.get("uin") and params.get("key"):
+                signed_urls.append(candidate.fetch_url)
+        if not signed_urls:
+            return None
+        payload = "\n".join(sorted(set(signed_urls))).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()
 
     def _iter_files(self):
         roots = self._profile_roots()

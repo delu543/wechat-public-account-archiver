@@ -16,7 +16,8 @@
 - Public search discovery: optional, conservative discovery through public search results.
 - Local website: `main.py web` starts a local UI for URL submission, fixed URL-history-first archive jobs, job progress/ETA, account folder browsing, article lists, and Markdown reading.
 - Local website date selection: the task form accepts an optional start date and keeps that exact boundary through discovery, staged retries, and progress reporting.
-- Local website session recovery: URL and exact-`biz` discovery remain the fast path; when the signed history session is stale, the foreground helper starts from the WeChat main window, selects the public `搜一搜` result, filters to `文章`, opens one public result, and retries exact-`biz` history. It does not depend on account-profile tab layouts.
+- Local website session recovery: saved article URL and exact-`biz` discovery remain the fast path; when the signed history session is stale, the foreground helper clicks the main WeChat window's fresh global search field (never `Command-F` or chat-history search), opens a new public `搜一搜` window, replaces any related suggestion with the exact account name, selects the public-account result, tries the `文章` column at bounded profile-header positions, waits for that exact account's opaque signed-session fingerprint to change, and only then retries exact-`biz` history.
+- Automation newest-first boundary: every weekly/manual automation cycle starts history pagination at offset `0`, then keeps the stored inclusive `since_date` through discovery and every crawl pass, so it collects the newest items back to the prior cutoff instead of resuming from a stale CLI offset.
 - Local website staged crawl: web archive jobs run a fast first body crawl, low-concurrency failed retry, conservative `unavailable` retry, unresolved-reason summary, and exact-account Markdown export.
 - Per-run URL scope: staged crawl, conservative retries, and unresolved counts are limited to URLs returned by that run's history pagination, so older account failures remain auditable without polluting or slowing the current increment.
 - Completed job summaries distinguish already archived URLs from newly saved articles, making overlap de-duplication explicit without repeating old articles in Word output.
@@ -53,6 +54,7 @@
 - No private database decryption.
 - No raw signed URL/token material in ordinary reports.
 - No screen-protection bypass; protected WeChat pixels are neither captured nor persisted.
+- No search or reading of the user's historical chat messages; visible recovery uses only the main-window global search field and public-account pages.
 - No automatic Mac unlock or password entry.
 - Local website APIs must not expose raw signed URL/token material.
 - Date-limited runs must not delete previously archived older articles; a later full-history run can still process URLs previously marked out of range.

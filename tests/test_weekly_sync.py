@@ -265,6 +265,8 @@ def test_existing_crawler_opens_wechat_only_after_direct_session_failure(tmp_pat
 
     def known(self, runtime, **kwargs):
         calls.append(kwargs)
+        assert runtime.since_date == job["since_date"]
+        assert self.config["history"]["start_offset"] == 0
         if len(calls) == 1:
             runtime.mark_needs_session("expired visible session")
         else:
@@ -277,11 +279,18 @@ def test_existing_crawler_opens_wechat_only_after_direct_session_failure(tmp_pat
     adapter = ExistingCrawlerAdapter(
         storage,
         tmp_path / "output",
-        {"automation": {"prepare_wechat_session": True}},
+        {
+            "automation": {"prepare_wechat_session": True},
+            "history": {"app_data_dir": str(tmp_path / "wechat"), "start_offset": 90},
+        },
     )
-    adapter.session_refresher.prepare_account = (
-        lambda name, seed_url=None: preparations.append((name, seed_url)) or Preparation()
-    )
+
+    def prepare(name, seed_url=None, *, session_fingerprint=None, **_kwargs):
+        assert callable(session_fingerprint)
+        preparations.append((name, seed_url))
+        return Preparation()
+
+    adapter.session_refresher.prepare_account = prepare
 
     result = adapter.run(subscription, job, lambda *_args: None)
 

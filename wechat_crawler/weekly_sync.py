@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 from .automation_store import AutomationStore
 from .cleanup import ArchiveCleanup
+from .crawler.discoverers.wechat_cache_discoverer import WechatCacheDiscoverer
 from .crawler.normalizer import safe_path_part
 from .crawler.storage import Storage
 from .incremental_word import IncrementalWordExporter
@@ -66,7 +67,13 @@ class ExistingCrawlerAdapter:
     ) -> CrawlResult:
         from .web_app import ArchiveJob, ArchiveWebService
 
-        service = ArchiveWebService(self.storage, self.output_dir, self.config)
+        # Every scheduled/manual incremental cycle must begin at the newest
+        # history page. A CLI-only resume offset must never leak into weekly
+        # automation, otherwise new articles before that offset are skipped.
+        service_config = dict(self.config)
+        service_config["history"] = dict(self.config.get("history", {}))
+        service_config["history"]["start_offset"] = 0
+        service = ArchiveWebService(self.storage, self.output_dir, service_config)
         with self.storage.connect() as conn:
             account = conn.execute(
                 "SELECT id, account_name, biz, wechat_id FROM accounts WHERE id = ?",
@@ -111,9 +118,22 @@ class ExistingCrawlerAdapter:
         runtime = execute()
         automation_cfg = self.config.get("automation", {})
         if runtime.status == "needs_session" and automation_cfg.get("prepare_wechat_session", False):
+            history_cfg = self.config.get("history", {})
+            session_cache = WechatCacheDiscoverer(
+                history_cfg.get(
+                    "app_data_dir",
+                    "~/Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data",
+                ),
+                target_biz=str(account["biz"]),
+                target_wechat_id=account["wechat_id"],
+            )
             preparation = self.session_refresher.prepare_account(
                 str(account["account_name"]),
                 seed_url=str(subscription["seed_url"]),
+                session_fingerprint=session_cache.session_fingerprint,
+                session_timeout_seconds=float(
+                    automation_cfg.get("session_ready_timeout_seconds", 15.0)
+                ),
             )
             if preparation.article_open_attempted:
                 progress("preflight", 16, {})

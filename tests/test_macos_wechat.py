@@ -120,6 +120,30 @@ def test_probe_defers_while_screen_is_locked(monkeypatch):
     assert status.capture_strategy == "deferred_until_unlock"
 
 
+def test_probe_defers_when_wechat_only_exposes_login_window(monkeypatch):
+    monkeypatch.setattr("wechat_crawler.macos_wechat.sys.platform", "darwin")
+
+    def runner(command, **_kwargs):
+        if command[0] == "ps":
+            return completed(
+                command,
+                stdout=(
+                    "100 1 /Applications/微信.app/Contents/MacOS/WeChat\n"
+                    "101 100 /Applications/微信.app/Contents/MacOS/WeChatAppEx.app/Contents/MacOS/WeChatAppEx\n"
+                ),
+            )
+        if command[0] == "ioreg":
+            return completed(command, stdout='"IOConsoleLocked" = No\n')
+        if command[0] == "osascript":
+            return completed(command, stdout="微信\t594\t275\t280\t380\tfalse\n")
+        raise AssertionError(command)
+
+    status = WechatWindowProbe(runner).inspect()
+
+    assert status.state == "needs_login"
+    assert status.capture_strategy == "deferred_until_login"
+
+
 def test_probe_activation_does_not_enumerate_accessibility_windows(monkeypatch):
     monkeypatch.setattr("wechat_crawler.macos_wechat.sys.platform", "darwin")
     commands = []
@@ -143,6 +167,33 @@ def test_probe_activates_named_window_through_wechat_menu(monkeypatch):
     assert WechatWindowProbe(runner).activate_window("公众号") is True
     assert commands[0][0:2] == ["osascript", "-e"]
     assert commands[0][-1] == "公众号"
+
+
+def test_session_refresher_closes_only_stale_public_recovery_windows():
+    input_driver = FakeInput()
+    activated = []
+
+    class Probe:
+        def activate_window(self, title):
+            activated.append(title)
+            return True
+
+    refresher = WechatSessionRefresher(
+        Probe(),
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    )
+    windows = (
+        WechatWindow("微信", 0, 0, 624, 864),
+        WechatWindow("搜索聊天记录", 300, 100, 720, 640, True),
+        WechatWindow("公众号", 400, 60, 600, 800),
+        WechatWindow("微信 (窗口)", 100, 20, 624, 858),
+        WechatWindow("普通聊天", 20, 20, 600, 800),
+    )
+
+    assert refresher._close_stale_recovery_windows(windows) is True
+    assert activated == ["公众号", "微信 (窗口)"]
+    assert input_driver.keys == [(13, 1 << 20)] * 2
 
 
 def test_session_refresher_restores_clipboard_when_public_search_window_is_missing():
@@ -182,7 +233,8 @@ def test_session_refresher_restores_clipboard_when_public_search_window_is_missi
     ).prepare_account("子说一点")
 
     assert result.status == "unverified"
-    assert input_driver.clicks == []
+    assert input_driver.clicks == [(143, 30)]
+    assert (3, 1 << 20) not in input_driver.keys
     assert clipboard_writes == ["子说一点".encode("utf-8"), b"original"]
 
 
@@ -267,10 +319,174 @@ def test_session_refresher_opens_first_public_article_search_result():
 
     assert result.status == "attempted"
     assert input_driver.clicks == [
-        (390, 150),
+        (143, 30),
+        (337, 105),
         (390, 150),
         (399, 268),
+        (634, 288),
+        (700, 404),
     ]
+    assert input_driver.keys.count((0, 1 << 20)) == 2
+    assert input_driver.keys.count((9, 1 << 20)) == 2
+
+
+def test_session_refresher_tries_expanded_profile_header_after_compact_layout():
+    input_driver = FakeInput()
+    fingerprint_calls = 0
+
+    def fingerprint():
+        nonlocal fingerprint_calls
+        fingerprint_calls += 1
+        return "new" if fingerprint_calls >= 4 else "old"
+
+    class Probe:
+        def inspect(self):
+            return WechatRuntimeStatus(
+                "ready",
+                "ready",
+                True,
+                True,
+                (
+                    WechatWindow("微信", 0, 0, 624, 864),
+                    WechatWindow("微信 (窗口)", 100, 20, 624, 858),
+                    WechatWindow("公众号", 400, 60, 600, 800),
+                ),
+                "outer_ax_plus_renderer_process",
+            )
+
+        def activate_main_window(self):
+            return True
+
+        def activate_window(self, _title):
+            return True
+
+    def runner(command, **kwargs):
+        if command[0] == "pbpaste":
+            return subprocess.CompletedProcess(command, 0, stdout=b"original", stderr=b"")
+        if command[0] == "pbcopy":
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    result = WechatSessionRefresher(
+        Probe(),
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    ).prepare_account(
+        "测试公众号",
+        session_fingerprint=fingerprint,
+        session_timeout_seconds=0.04,
+        session_poll_interval_seconds=0.01,
+    )
+
+    assert result.status == "attempted"
+    assert result.article_open_attempted is True
+    assert input_driver.clicks[-6:] == [
+        (634, 288),
+        (700, 404),
+        (634, 308),
+        (700, 424),
+        (634, 328),
+        (700, 444),
+    ]
+
+
+def test_session_refresher_waits_for_exact_account_session_change():
+    input_driver = FakeInput()
+    fingerprints = iter(["old", "old", "new"])
+
+    class Probe:
+        def inspect(self):
+            return WechatRuntimeStatus(
+                "ready",
+                "ready",
+                True,
+                True,
+                (
+                    WechatWindow("微信", 0, 0, 624, 864),
+                    WechatWindow("微信 (窗口)", 100, 20, 624, 858),
+                    WechatWindow("公众号", 400, 60, 600, 800),
+                ),
+                "outer_ax_plus_renderer_process",
+            )
+
+        def activate_main_window(self):
+            return True
+
+        def activate_window(self, _title):
+            return True
+
+    def runner(command, **kwargs):
+        if command[0] == "pbpaste":
+            return subprocess.CompletedProcess(command, 0, stdout=b"original", stderr=b"")
+        if command[0] == "pbcopy":
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    result = WechatSessionRefresher(
+        Probe(),
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    ).prepare_account(
+        "测试公众号",
+        session_fingerprint=lambda: next(fingerprints),
+        session_timeout_seconds=1,
+        session_poll_interval_seconds=0.01,
+    )
+
+    assert result.status == "attempted"
+    assert result.article_open_attempted is True
+    assert "精确公众号主页" in result.message
+    assert "最新页" in result.message
+
+
+def test_session_refresher_does_not_claim_success_without_session_change():
+    input_driver = FakeInput()
+
+    class Probe:
+        def inspect(self):
+            return WechatRuntimeStatus(
+                "ready",
+                "ready",
+                True,
+                True,
+                (
+                    WechatWindow("微信", 0, 0, 624, 864),
+                    WechatWindow("微信 (窗口)", 100, 20, 624, 858),
+                    WechatWindow("公众号", 400, 60, 600, 800),
+                ),
+                "outer_ax_plus_renderer_process",
+            )
+
+        def activate_main_window(self):
+            return True
+
+        def activate_window(self, _title):
+            return True
+
+    def runner(command, **kwargs):
+        if command[0] == "pbpaste":
+            return subprocess.CompletedProcess(command, 0, stdout=b"original", stderr=b"")
+        if command[0] == "pbcopy":
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    result = WechatSessionRefresher(
+        Probe(),
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    ).prepare_account(
+        "测试公众号",
+        session_fingerprint=lambda: "unchanged",
+        session_timeout_seconds=0.02,
+        session_poll_interval_seconds=0.01,
+    )
+
+    assert result.status == "unverified"
+    assert result.article_open_attempted is True
+    assert "尚未确认" in result.message
 
 
 def test_session_refresher_requires_public_search_and_profile_windows():
@@ -309,4 +525,5 @@ def test_session_refresher_requires_public_search_and_profile_windows():
 
     assert result.status == "unverified"
     assert input_driver.clicks[0] == (49, 188)
-    assert len(input_driver.clicks) == 1
+    assert input_driver.clicks[1] == (143, 63)
+    assert len(input_driver.clicks) == 2

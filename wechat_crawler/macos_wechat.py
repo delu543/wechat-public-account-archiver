@@ -163,6 +163,9 @@ class WechatWindowProbe:
         )
         screen_locked = self._screen_locked()
         windows = tuple(self._read_windows()) if app_running else ()
+        login_shell = bool(windows) and all(
+            window.width <= 360 and window.height <= 500 for window in windows
+        )
         if not app_running:
             state = "not_running"
             message = "微信未运行；自动任务将暂停，不会尝试登录或修改网络设置"
@@ -171,6 +174,10 @@ class WechatWindowProbe:
             state = "screen_locked"
             message = "Mac 屏幕已锁定；任务将保留并在解锁后重试，不会操作登录界面"
             strategy = "deferred_until_unlock"
+        elif login_shell:
+            state = "needs_login"
+            message = "微信当前显示登录窗口；自动任务将暂停，等待用户正常登录"
+            strategy = "deferred_until_login"
         elif not renderer_running:
             state = "starting"
             message = "微信外层进程已启动，内容渲染进程尚未就绪"
@@ -341,6 +348,10 @@ class WechatSessionRefresher:
         self,
         account_name: str,
         seed_url: str | None = None,
+        *,
+        session_fingerprint: Callable[[], str | None] | None = None,
+        session_timeout_seconds: float = 15.0,
+        session_poll_interval_seconds: float = 0.75,
     ) -> WechatPreparationResult:
         name = account_name.strip()
         if not name:
@@ -356,8 +367,11 @@ class WechatSessionRefresher:
             ),
             None,
         )
+        if not self._close_stale_recovery_windows(before.windows):
+            return WechatPreparationResult("failed", "无法关闭上一轮公众号公开浏览窗口", name, False)
         if not self.probe.activate_main_window():
             return WechatPreparationResult("failed", "无法激活微信主窗口", name, False)
+        baseline_fingerprint = self._safe_session_fingerprint(session_fingerprint)
         if main_window is not None and len(before.windows) > 1:
             # Article/search child windows are normally offset to the right.
             # Prefer WeChat's own Window menu, then use the exposed left rail
@@ -372,7 +386,7 @@ class WechatSessionRefresher:
         try:
             if not self._write_clipboard(name.encode("utf-8")):
                 return WechatPreparationResult("failed", "无法临时写入剪贴板", name, False)
-            if not self._open_global_search():
+            if not self._open_global_search(main_window):
                 return WechatPreparationResult("failed", "无法打开微信主界面搜索", name, False)
             # The first row is commonly the local account card. The second row
             # is the public "搜一搜" route that opens the article search page.
@@ -387,32 +401,102 @@ class WechatSessionRefresher:
             if callable(activate_named):
                 activate_named(search_window.title)
             self._sleep(0.2)
+            if not self._submit_exact_public_search(search_window):
+                return WechatPreparationResult("failed", "无法在微信公开搜索页提交精确公众号名", name, False)
+            self._sleep(1.0)
+            search_window = self._window_named("微信 (窗口)") or search_window
             if not self._click_ratio(search_window, 0.465, 0.152):
-                return WechatPreparationResult("failed", "无法切换微信搜一搜文章分类", name, False)
-            self._sleep(0.25)
-            if not self._click_ratio(search_window, 0.465, 0.152):
-                return WechatPreparationResult("failed", "无法确认微信搜一搜文章分类", name, False)
+                return WechatPreparationResult("failed", "无法切换微信搜一搜账号分类", name, False)
             self._sleep(1.2)
             search_window = self._window_named("微信 (窗口)") or search_window
             if not self._click_ratio(search_window, 0.48, 0.29):
-                return WechatPreparationResult("failed", "无法打开搜一搜中的公开文章", name, False)
-            self._sleep(2.0)
+                return WechatPreparationResult("failed", "无法打开搜一搜中的公众号主页", name, False)
+            self._sleep(1.0)
+            profile_window = self._wait_for_window("公众号", timeout=2.0)
+            if profile_window is None:
+                return WechatPreparationResult("unverified", "未识别到新打开的公众号主页", name, False)
+            if callable(activate_named):
+                activate_named(profile_window.title)
+            self._sleep(0.2)
+            layouts = ((0.285, 0.43), (0.31, 0.455), (0.335, 0.48))
+            if session_fingerprint is None:
+                layouts = layouts[:1]
+            quick_layout_timeout = min(
+                session_timeout_seconds / len(layouts),
+                session_poll_interval_seconds,
+            )
+            article_open_attempted = False
+            for tab_y_ratio, article_y_ratio in layouts:
+                if callable(activate_named) and not activate_named(profile_window.title):
+                    return WechatPreparationResult("failed", "无法重新聚焦公众号主页", name, article_open_attempted)
+                self._sleep(0.2)
+                profile_window = self._window_named("公众号") or profile_window
+                if not self._click_ratio(profile_window, 0.39, tab_y_ratio):
+                    return WechatPreparationResult("failed", "无法切换公众号主页的文章分类", name, article_open_attempted)
+                self._sleep(0.8)
+                profile_window = self._window_named("公众号") or profile_window
+                if not self._click_ratio(profile_window, 0.50, article_y_ratio):
+                    return WechatPreparationResult("failed", "无法打开公众号主页中的文章", name, article_open_attempted)
+                article_open_attempted = True
+                self._sleep(2.0)
+                if session_fingerprint is None or self._wait_for_session_change(
+                    session_fingerprint,
+                    baseline_fingerprint,
+                    timeout=quick_layout_timeout,
+                    interval=session_poll_interval_seconds,
+                ):
+                    break
+            else:
+                remaining_timeout = max(
+                    0.0,
+                    session_timeout_seconds - quick_layout_timeout * len(layouts),
+                )
+                if remaining_timeout <= 0 or not self._wait_for_session_change(
+                    session_fingerprint,
+                    baseline_fingerprint,
+                    timeout=remaining_timeout,
+                    interval=session_poll_interval_seconds,
+                ):
+                    return WechatPreparationResult(
+                        "unverified",
+                        "已从精确公众号主页有界尝试文章入口，但尚未确认新会话；历史接口将进行一次最终验证",
+                        name,
+                        article_open_attempted,
+                    )
             return WechatPreparationResult(
                 "attempted",
-                "已通过微信主界面搜一搜的文章分类打开一篇公开文章；历史接口将继续验证精确 biz",
+                "已从精确公众号主页打开文章并确认新会话；历史接口将从最新页继续验证精确 biz",
                 name,
                 True,
             )
         finally:
             self._write_clipboard(clipboard)
 
-    def _open_global_search(self) -> bool:
-        if not self._input.press_key(3, NativeMacInput.COMMAND_FLAG):  # Command-F
+    def _open_global_search(self, main_window: WechatWindow | None) -> bool:
+        # Command-F opens "搜索聊天记录" in current WeChat versions. The
+        # automation must use the main window's fresh global search field and
+        # must never inspect the user's historical chat messages.
+        if main_window is None or not self._click_ratio(main_window, 0.23, 0.035):
             return False
         self._sleep(0.35)
         return self._input.press_key(0, NativeMacInput.COMMAND_FLAG) and self._input.press_key(
             9, NativeMacInput.COMMAND_FLAG
         )
+
+    def _close_stale_recovery_windows(self, windows: Sequence[WechatWindow]) -> bool:
+        activate_named = getattr(self.probe, "activate_window", None)
+        stale_titles = ("公众号", "微信 (窗口)")
+        visible_titles = {window.title for window in windows}
+        for title in stale_titles:
+            if title not in visible_titles:
+                continue
+            if not callable(activate_named) or not activate_named(title):
+                return False
+            self._sleep(0.15)
+            if not self._input.press_key(13, NativeMacInput.COMMAND_FLAG):  # Command-W
+                return False
+            self._sleep(0.2)
+        return True
 
     def _confirm_public_search_result(self) -> bool:
         if not self._input.press_key(125):
@@ -422,6 +506,19 @@ class WechatSessionRefresher:
             return False
         self._sleep(0.2)
         return self._input.press_key(36)
+
+    def _submit_exact_public_search(self, search_window: WechatWindow) -> bool:
+        # WeChat may turn the main-window suggestion into a related query such
+        # as "<name>视频号". Replace it inside the newly opened public search
+        # page so account selection is always based on the exact copied name.
+        if not self._click_ratio(search_window, 0.38, 0.10):
+            return False
+        self._sleep(0.2)
+        return (
+            self._input.press_key(0, NativeMacInput.COMMAND_FLAG)
+            and self._input.press_key(9, NativeMacInput.COMMAND_FLAG)
+            and self._input.press_key(36)
+        )
 
     def _window_named(self, title: str) -> WechatWindow | None:
         candidates = [window for window in self.probe.inspect().windows if window.title == title and not window.minimized]
@@ -457,6 +554,38 @@ class WechatSessionRefresher:
         x = int(window.x + window.width * x_ratio)
         y = int(window.y + window.height * y_ratio)
         return self._input.click(x, y)
+
+    def _wait_for_session_change(
+        self,
+        fingerprint: Callable[[], str | None],
+        baseline: str | None,
+        *,
+        timeout: float,
+        interval: float,
+    ) -> bool:
+        bounded_timeout = max(0.0, float(timeout))
+        bounded_interval = max(0.05, float(interval))
+        deadline = time.monotonic() + bounded_timeout
+        max_attempts = max(1, int(bounded_timeout / bounded_interval) + 1)
+        for attempt in range(max_attempts):
+            current = self._safe_session_fingerprint(fingerprint)
+            if current and current != baseline:
+                return True
+            if attempt + 1 >= max_attempts or time.monotonic() >= deadline:
+                break
+            self._sleep(min(bounded_interval, max(0.0, deadline - time.monotonic())))
+        return False
+
+    @staticmethod
+    def _safe_session_fingerprint(
+        fingerprint: Callable[[], str | None] | None,
+    ) -> str | None:
+        if fingerprint is None:
+            return None
+        try:
+            return fingerprint()
+        except Exception:
+            return None
 
     def _read_clipboard(self) -> bytes:
         try:
