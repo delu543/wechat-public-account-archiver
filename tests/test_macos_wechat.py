@@ -238,6 +238,104 @@ def test_session_refresher_restores_clipboard_when_public_search_window_is_missi
     assert clipboard_writes == ["子说一点".encode("utf-8"), b"original"]
 
 
+def test_session_refresher_prefers_public_article_seed_url_over_account_name():
+    clipboard_writes = []
+    input_driver = FakeInput()
+    inspections = 0
+    fingerprints = iter(["old", "new"])
+    seed_url = "https://mp.weixin.qq.com/s/VU512lPD0QSTeGWDMh2ONQ"
+
+    class Probe:
+        def inspect(self):
+            nonlocal inspections
+            inspections += 1
+            windows = (WechatWindow("微信", 0, 0, 624, 864),)
+            if inspections > 1:
+                windows += (WechatWindow("微信 (窗口)", 100, 20, 624, 858),)
+            return WechatRuntimeStatus(
+                "ready",
+                "ready",
+                True,
+                True,
+                windows,
+                "outer_ax_plus_renderer_process",
+            )
+
+        def activate_main_window(self):
+            return True
+
+        def activate_window(self, _title):
+            return True
+
+    def runner(command, **kwargs):
+        if command[0] == "pbpaste":
+            return subprocess.CompletedProcess(command, 0, stdout=b"original", stderr=b"")
+        if command[0] == "pbcopy":
+            clipboard_writes.append(kwargs["input"])
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    result = WechatSessionRefresher(
+        Probe(),
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    ).prepare_account(
+        "子说一点",
+        seed_url=seed_url,
+        session_fingerprint=lambda: next(fingerprints),
+        session_timeout_seconds=1,
+        session_poll_interval_seconds=0.01,
+    )
+
+    assert result.status == "attempted"
+    assert result.article_open_attempted is True
+    assert clipboard_writes == [seed_url.encode("utf-8"), b"original"]
+    assert input_driver.clicks == [(143, 30), (399, 231)]
+    assert input_driver.keys == [
+        (0, 1 << 20),
+        (9, 1 << 20),
+        (36, 0),
+    ]
+    assert (125, 0) not in input_driver.keys
+
+
+def test_session_refresher_uses_account_name_when_seed_url_is_not_public_wechat_article():
+    clipboard_writes = []
+    input_driver = FakeInput()
+
+    class Probe:
+        def inspect(self):
+            return WechatRuntimeStatus(
+                "ready",
+                "ready",
+                True,
+                True,
+                (WechatWindow("微信", 0, 0, 624, 864),),
+                "outer_ax_plus_renderer_process",
+            )
+
+        def activate_main_window(self):
+            return True
+
+    def runner(command, **kwargs):
+        if command[0] == "pbpaste":
+            return subprocess.CompletedProcess(command, 0, stdout=b"original", stderr=b"")
+        if command[0] == "pbcopy":
+            clipboard_writes.append(kwargs["input"])
+            return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+        raise AssertionError(command)
+
+    WechatSessionRefresher(
+        Probe(),
+        runner=runner,
+        sleeper=lambda _seconds: None,
+        input_driver=input_driver,
+    ).prepare_account("子说一点", seed_url="https://example.com/not-wechat")
+
+    assert clipboard_writes == ["子说一点".encode("utf-8"), b"original"]
+
+
 def test_session_refresher_waits_then_selects_public_search_row():
     input_driver = FakeInput()
     inspections = 0

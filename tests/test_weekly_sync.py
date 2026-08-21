@@ -176,6 +176,46 @@ def test_word_export_uses_article_date_range_instead_of_internal_cycle_key(tmp_p
     assert "manual-" not in cover
 
 
+def test_word_export_labels_manual_date_range_without_changing_weekly_mode(tmp_path):
+    exporter = IncrementalWordExporter()
+    row = {
+        "title": "Range article",
+        "publish_time": "2026-08-04 09:00:00",
+        "source_url": "https://mp.weixin.qq.com/s/range",
+        "content_text": "Range body",
+    }
+
+    range_path = exporter.export_account(
+        [row],
+        tmp_path / "range-incremental.docx",
+        account_name="Account",
+        mode="range_incremental",
+        cycle_key="2026-08-04_to_2026-08-21",
+    )
+    weekly_path = exporter.export_account(
+        [row],
+        tmp_path / "weekly-incremental.docx",
+        account_name="Account",
+        mode="incremental",
+        cycle_key="2026-W32",
+    )
+
+    range_cover = "\n".join(paragraph.text for paragraph in Document(range_path).paragraphs[:4])
+    weekly_cover = "\n".join(paragraph.text for paragraph in Document(weekly_path).paragraphs[:4])
+    range_document = Document(range_path)
+    year_heading = next(
+        paragraph
+        for paragraph in range_document.paragraphs
+        if paragraph.style.name == "Heading 1"
+    )
+    assert "公众号区间增量归档" in range_cover
+    assert "区间增量" in range_cover
+    assert "公众号每周增量归档" in weekly_cover
+    assert "本周增量" in weekly_cover
+    assert year_heading.paragraph_format.page_break_before is True
+    assert b'w:type="page"' not in range_path.read_bytes()
+
+
 class NoopCrawler:
     def run(self, subscription, job, progress):
         return CrawlResult(status="completed", message="no updates")

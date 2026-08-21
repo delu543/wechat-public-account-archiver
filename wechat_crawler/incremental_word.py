@@ -61,8 +61,14 @@ class IncrementalWordExporter:
         for article in articles:
             year = self._article_year(article)
             if year != current_year:
+                first_year = current_year is None
                 current_year = year
-                document.add_heading(f"{year} 年" if year.isdigit() else year, level=1)
+                year_heading = document.add_heading(
+                    f"{year} 年" if year.isdigit() else year,
+                    level=1,
+                )
+                if first_year:
+                    year_heading.paragraph_format.page_break_before = True
             self._add_article(document, article)
         document.core_properties.title = self._document_title(account_name, mode)
         document.core_properties.subject = "微信公众号公开文章本地归档"
@@ -186,11 +192,10 @@ class IncrementalWordExporter:
         self._set_east_asia(run, CJK_FONT)
         meta = document.add_paragraph()
         meta.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        mode_label = "首次全量" if mode == "initial_full" else "本周增量"
+        mode_label = self._mode_label(mode)
         meta.add_run(
             f"{mode_label}  ｜  {count} 篇  ｜  {period_label}  ｜  {generated:%Y-%m-%d %H:%M}"
         )
-        document.add_page_break()
 
     def _add_article(self, document: Document, article: Mapping[str, Any]) -> None:
         document.add_heading(str(self._value(article, "title") or "未命名文章"), level=2)
@@ -348,8 +353,21 @@ class IncrementalWordExporter:
 
     @staticmethod
     def _document_title(account_name: str, mode: str) -> str:
-        suffix = "公众号首次全量归档" if mode == "initial_full" else "公众号每周增量归档"
+        if mode == "initial_full":
+            suffix = "公众号首次全量归档"
+        elif mode == "range_incremental":
+            suffix = "公众号区间增量归档"
+        else:
+            suffix = "公众号每周增量归档"
         return f"{account_name}\n{suffix}"
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        if mode == "initial_full":
+            return "首次全量"
+        if mode == "range_incremental":
+            return "区间增量"
+        return "本周增量"
 
     @staticmethod
     def _set_east_asia(run: Any, font_name: str) -> None:

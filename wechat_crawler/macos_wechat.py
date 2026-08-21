@@ -6,6 +6,7 @@ import sys
 import time
 from dataclasses import asdict, dataclass
 from typing import Callable, Protocol, Sequence
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -384,10 +385,20 @@ class WechatSessionRefresher:
 
         clipboard = self._read_clipboard()
         try:
-            if not self._write_clipboard(name.encode("utf-8")):
+            public_seed_url = self._public_article_seed_url(seed_url)
+            search_value = public_seed_url or name
+            if not self._write_clipboard(search_value.encode("utf-8")):
                 return WechatPreparationResult("failed", "无法临时写入剪贴板", name, False)
             if not self._open_global_search(main_window):
                 return WechatPreparationResult("failed", "无法打开微信主界面搜索", name, False)
+            if public_seed_url:
+                return self._open_public_seed_article(
+                    name,
+                    session_fingerprint=session_fingerprint,
+                    baseline_fingerprint=baseline_fingerprint,
+                    session_timeout_seconds=session_timeout_seconds,
+                    session_poll_interval_seconds=session_poll_interval_seconds,
+                )
             # The first row is commonly the local account card. The second row
             # is the public "搜一搜" route that opens the article search page.
             self._sleep(1.0)
@@ -471,6 +482,63 @@ class WechatSessionRefresher:
             )
         finally:
             self._write_clipboard(clipboard)
+
+    @staticmethod
+    def _public_article_seed_url(value: str | None) -> str | None:
+        if not value:
+            return None
+        candidate = value.strip()
+        parsed = urlparse(candidate)
+        if parsed.scheme not in ("http", "https") or parsed.netloc.lower() != "mp.weixin.qq.com":
+            return None
+        if parsed.path != "/s" and not parsed.path.startswith("/s/"):
+            return None
+        return candidate
+
+    def _open_public_seed_article(
+        self,
+        account_name: str,
+        *,
+        session_fingerprint: Callable[[], str | None] | None,
+        baseline_fingerprint: str | None,
+        session_timeout_seconds: float,
+        session_poll_interval_seconds: float,
+    ) -> WechatPreparationResult:
+        # Pasting a public article URL into the fresh global search first opens
+        # WeChat's public Search page. The top "访问网页" card then opens the
+        # exact article. Do not search the account name when a seed URL exists.
+        self._sleep(0.8)
+        if not self._input.press_key(36):
+            return WechatPreparationResult("failed", "无法提交公开文章链接", account_name, False)
+        search_window = self._wait_for_window("微信 (窗口)", timeout=2.0)
+        if search_window is None:
+            return WechatPreparationResult("unverified", "未识别到链接的微信公开搜索页", account_name, False)
+        activate_named = getattr(self.probe, "activate_window", None)
+        if callable(activate_named):
+            activate_named(search_window.title)
+        self._sleep(0.2)
+        search_window = self._window_named("微信 (窗口)") or search_window
+        if not self._click_ratio(search_window, 0.48, 0.247):
+            return WechatPreparationResult("failed", "无法打开链接的访问网页入口", account_name, False)
+        self._sleep(2.0)
+        if session_fingerprint is not None and not self._wait_for_session_change(
+            session_fingerprint,
+            baseline_fingerprint,
+            timeout=session_timeout_seconds,
+            interval=session_poll_interval_seconds,
+        ):
+            return WechatPreparationResult(
+                "unverified",
+                "已通过保存的公开文章链接打开正文，但尚未确认新会话；历史接口将进行一次最终验证",
+                account_name,
+                True,
+            )
+        return WechatPreparationResult(
+            "attempted",
+            "已通过保存的公开文章链接打开正文；历史接口将从最新页继续验证精确 biz",
+            account_name,
+            True,
+        )
 
     def _open_global_search(self, main_window: WechatWindow | None) -> bool:
         # Command-F opens "搜索聊天记录" in current WeChat versions. The
