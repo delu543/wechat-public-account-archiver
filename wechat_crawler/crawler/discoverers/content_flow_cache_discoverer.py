@@ -13,6 +13,7 @@ import threading
 from bs4 import BeautifulSoup
 from v8serialize import V8SerializeError, loads
 
+from wechat_crawler.chromium_indexeddb_values import SNAPPY_PREFIX, unwrap_indexeddb_value
 from wechat_crawler.crawler.dedup import normalized_text_hash
 from wechat_crawler.crawler.models import ParsedArticle
 from wechat_crawler.crawler.normalizer import normalize_url
@@ -156,9 +157,27 @@ class WechatContentFlowCacheDiscoverer:
             signal.signal(signal.SIGALRM, previous)
 
     def _decode_batches(self, data: bytes):
+        if data.startswith(SNAPPY_PREFIX):
+            try:
+                data = unwrap_indexeddb_value(data)
+            except ValueError:
+                # Never scan fragments inside a corrupt compressed value.
+                return
         starts = set(range(min(16, len(data))))
         starts.update(match.start() for match in re.finditer(re.escape(b"\xff\x0f"), data))
+        attempted, padding_end = set(), 0
         for start in sorted(starts):
+            # V8 accepts zero padding before a value. Native envelopes contain
+            # twelve such bytes: trying each one re-decodes the same full batch
+            # thirteen times. Normalize only padding, retaining distinct values.
+            if start < padding_end:
+                continue
+            while start < len(data) and data[start] == 0:
+                start += 1
+            padding_end = start
+            if start == len(data) or start in attempted:
+                continue
+            attempted.add(start)
             try:
                 obj = loads(data[start:])
             except (V8SerializeError, ValueError, TypeError, EOFError):

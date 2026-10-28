@@ -23,6 +23,7 @@ from .crawler.discoverers.wechat_cache_discoverer import WechatCacheDiscoverer
 from .crawler.discoverers.history_discoverer import (
     HistoryDiscoveryError,
     SESSION_RECOVERY_STEPS,
+    is_history_access_restriction,
     is_session_recovery_error,
     session_recovery_guidance,
 )
@@ -34,6 +35,10 @@ from .crawler.parser import ParseError, WechatArticleParser
 from .crawler.storage import Storage
 from .macos_wechat import WechatSessionRefresher, WechatWindowProbe
 from .weekly_sync import WeeklySyncRunner
+
+
+class AutomationPausedError(ValueError):
+    """Raised at safe checkpoints when the persistent master pause is active."""
 
 
 @dataclass
@@ -101,6 +106,15 @@ class ArchiveJob:
         self.message = message
         self.finished_at = time.time()
 
+    def mark_blocked(self, message: str) -> None:
+        self.status = "blocked"
+        self.phase = "微信访问受限"
+        self.message = message
+        self.eta_seconds = None
+        self.recovery_action = "已停止相关请求和自动微信操作；保留断点，正常验证完成后再明确重试。"
+        self.recovery_steps = []
+        self.finished_at = time.time()
+
     def mark_needs_session(self, message: str) -> None:
         self.status = "needs_session"
         self.phase = "等待微信会话"
@@ -113,6 +127,13 @@ class ArchiveJob:
             "任务已保留进度，不会重复导出或改用第三方搜索。"
         )
         self.recovery_steps = list(SESSION_RECOVERY_STEPS)
+        self.finished_at = time.time()
+
+    def mark_paused(self) -> None:
+        self.status = "paused"
+        self.phase = "已暂停"
+        self.message = "全部爬取已暂停；点击菜单栏插件中的“继续全部爬取”后可恢复"
+        self.eta_seconds = None
         self.finished_at = time.time()
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,11 +188,15 @@ class ArchiveWebService:
         self.recovered_crawl_runs = self.storage.recover_interrupted_runs()
         self.recovered_sync_jobs = self.automation.recover_interrupted_jobs()
         automation_cfg = self.config.get("automation", {})
-        self.automation.adopt_existing_accounts(
-            schedule_weekday=int(automation_cfg.get("weekday", 6)),
-            schedule_hour=int(automation_cfg.get("hour", 20)),
-            schedule_minute=int(automation_cfg.get("minute", 0)),
-        )
+        # The startup path must stay cheap on multi-gigabyte archives. Only a
+        # completely unmigrated database needs the one-time adoption scan;
+        # normal account additions register their subscription explicitly.
+        if not self.automation.has_subscriptions():
+            self.automation.adopt_existing_accounts(
+                schedule_weekday=int(automation_cfg.get("weekday", 6)),
+                schedule_hour=int(automation_cfg.get("hour", 21)),
+                schedule_minute=int(automation_cfg.get("minute", 0)),
+            )
         self.weekly_runner = WeeklySyncRunner(storage, self.output_dir, config)
         self.scheduler_running = False
 
@@ -251,6 +276,7 @@ class ArchiveWebService:
         }
 
     def start_reverse_job(self, input_url: str, since_date: str | None = None) -> ArchiveJob:
+        self._ensure_automation_active()
         normalized_since = normalize_date(since_date, "since")
         job = ArchiveJob(job_id=str(uuid.uuid4()), input_url=input_url, since_date=normalized_since)
         with self._lock:
@@ -265,17 +291,35 @@ class ArchiveWebService:
 
     def automation_overview(self, *, include_cleanup_stats: bool = True) -> dict[str, Any]:
         subscriptions = self.automation.list_subscriptions()
+        control = self.automation.automation_control()
         enabled = [row for row in subscriptions if int(row["enabled"])]
         next_runs = [str(row["next_run_at"]) for row in enabled if row["next_run_at"]]
         latest_jobs = self.automation.list_jobs(limit=20)
         running = [
             row for row in latest_jobs
-            if row["status"] not in ("completed", "failed", "blocked", "needs_session")
+            if row["status"] not in ("completed", "failed", "blocked", "needs_session", "paused", "superseded")
         ]
         reclaimable_bytes: int | None = None
         if include_cleanup_stats:
             cleanup = ArchiveCleanup(self.storage, self.output_dir).prune(execute=False)
             reclaimable_bytes = cleanup.raw_html_bytes + cleanup.temporary_bytes
+        if control["paused"]:
+            session_cache = {
+                "status": "paused",
+                "message": "全部爬取已暂停；不会检查或操作微信",
+            }
+            wechat_window = {
+                "state": "paused",
+                "message": "全部爬取已暂停；不会检查或操作微信",
+                "app_running": False,
+                "renderer_running": False,
+                "windows": [],
+                "capture_strategy": "none",
+                "screen_locked": False,
+            }
+        else:
+            session_cache = self._wechat_session_cache_status()
+            wechat_window = WechatWindowProbe().inspect().to_dict()
         return {
             "database_path": str(self.storage.db_path.resolve()),
             "output_dir": str(self.output_dir.resolve()),
@@ -285,11 +329,13 @@ class ArchiveWebService:
             "pending_export_count": sum(int(row["pending_export_count"] or 0) for row in subscriptions),
             "next_run_at": min(next_runs) if next_runs else None,
             "scheduler_running": self.scheduler_running,
+            "automation_paused": control["paused"],
+            "automation_paused_at": control["updated_at"] if control["paused"] else None,
             "running_job_count": len(running),
             "reclaimable_bytes": reclaimable_bytes,
             "schedule": self._schedule_payload(enabled or subscriptions),
-            "wechat_session_cache": self._wechat_session_cache_status(),
-            "wechat_window": WechatWindowProbe().inspect().to_dict(),
+            "wechat_session_cache": session_cache,
+            "wechat_window": wechat_window,
             "recovered_interrupted_runs": self.recovered_crawl_runs + self.recovered_sync_jobs,
         }
 
@@ -298,7 +344,19 @@ class ArchiveWebService:
             "status": "ok",
             "database": str(self.storage.db_path.resolve()),
             "scheduler_running": self.scheduler_running,
+            "automation_paused": self.automation.is_automation_paused(),
         }
+
+    def _ensure_automation_active(self, run_id: int | None = None) -> None:
+        if self.automation.is_automation_paused():
+            if run_id is not None:
+                self.storage.finish_run(run_id, "blocked", notes="全部爬取已由用户暂停")
+            raise AutomationPausedError("全部爬取已暂停；请先在菜单栏插件中点击“继续”")
+
+    def set_automation_paused(self, paused: bool) -> dict[str, Any]:
+        if not isinstance(paused, bool):
+            raise ValueError("paused must be a boolean")
+        return self.automation.set_automation_paused(paused)
 
     def _wechat_session_cache_status(self) -> dict[str, str]:
         history_cfg = self.config.get("history", {})
@@ -407,11 +465,12 @@ class ArchiveWebService:
         subscriptions = self.list_automation_subscriptions()
         jobs = self.list_automation_jobs(limit=20)
         batches = self.list_export_batches(limit=1)
+        completion = self.automation.latest_completed_cycle()
         active = next(
             (
                 job
                 for job in jobs
-                if job["status"] not in ("completed", "failed", "blocked", "needs_session")
+                if job["status"] not in ("completed", "failed", "blocked", "needs_session", "paused", "superseded")
             ),
             None,
         )
@@ -424,16 +483,18 @@ class ArchiveWebService:
         if attention:
             first = attention[0]
             attention_message = f"{first['account_name']}：{first['last_error'] or first['state']}"
-        session_requests = [
-            {
-                "subscription_id": row["id"],
-                "account_name": row["account_name"],
-                "account_biz": row["account_biz"],
-                "request_key": f"{row['id']}:{row['state']}:{row['next_run_at'] or ''}",
-            }
-            for row in attention
-            if row["state"] == "needs_session"
-        ]
+        session_requests = []
+        if not overview["automation_paused"]:
+            session_requests = [
+                {
+                    "subscription_id": row["id"],
+                    "account_name": row["account_name"],
+                    "account_biz": row["account_biz"],
+                    "request_key": f"{row['id']}:{row['state']}:{row['next_run_at'] or ''}",
+                }
+                for row in attention
+                if row["state"] == "needs_session"
+            ]
         if session_requests and overview["wechat_window"]["state"] == "screen_locked":
             attention_message = "Mac 屏幕已锁定；已保留任务，解锁后将继续，不会操作登录界面"
         return {
@@ -442,6 +503,18 @@ class ArchiveWebService:
             "attention_message": attention_message,
             "current_job": active,
             "latest_word": batches[0] if batches else None,
+            "latest_completion": (
+                {
+                    "cycle_key": completion["cycle_key"],
+                    "scheduled_for": completion["scheduled_for"],
+                    "completed_at": completion["completed_at"],
+                    "output_folder": completion["output_folder"],
+                    "account_count": int(completion["completed_account_count"]),
+                    "exported_count": int(completion["exported_count"]),
+                }
+                if completion is not None
+                else None
+            ),
             "output_dir": str(self.output_dir.resolve()),
             "session_requests": session_requests,
         }
@@ -464,6 +537,7 @@ class ArchiveWebService:
         return target
 
     def start_subscription_run(self, subscription_id: int) -> dict[str, Any]:
+        self._ensure_automation_active()
         with self.storage.connect() as conn:
             subscription = conn.execute(
                 "SELECT id FROM subscriptions WHERE id = ?", (subscription_id,)
@@ -481,6 +555,42 @@ class ArchiveWebService:
         thread = threading.Thread(
             target=self.weekly_runner.run_job,
             args=(str(job["id"]),),
+            daemon=True,
+        )
+        thread.start()
+        return self.get_automation_job(str(job["id"]))
+
+    def resume_subscription_after_session(self, subscription_id: int) -> dict[str, Any]:
+        """Idempotently resume a waiting job when foreground work has not.
+
+        The stable foreground helper normally resumes and completes the same
+        job itself so macOS attributes protected WeChat-container reads to one
+        authorized App identity. The local POST remains a compatibility
+        fallback; if the foreground helper already advanced the job, return its
+        current state without starting a duplicate worker.
+        """
+        self._ensure_automation_active()
+        job = self.automation.latest_resumable_job(subscription_id)
+        if job is None or job["status"] != "needs_session":
+            with self.storage.connect() as conn:
+                latest = conn.execute(
+                    """
+                    SELECT id FROM sync_jobs
+                    WHERE subscription_id = ?
+                    ORDER BY scheduled_for DESC, created_at DESC
+                    LIMIT 1
+                    """,
+                    (subscription_id,),
+                ).fetchone()
+            if latest is None:
+                raise ValueError("subscription has no job to resume")
+            return self.get_automation_job(str(latest["id"]))
+        resume_config = json.loads(json.dumps(self.config))
+        resume_config.setdefault("automation", {})["prepare_wechat_session"] = False
+        runner = WeeklySyncRunner(self.storage, self.output_dir, resume_config)
+        thread = threading.Thread(
+            target=runner.resume_latest_scheduled,
+            args=(subscription_id,),
             daemon=True,
         )
         thread.start()
@@ -556,6 +666,7 @@ class ArchiveWebService:
 
     def _run_reverse_job(self, job: ArchiveJob) -> None:
         try:
+            self._ensure_automation_active()
             job.mark_running("解析账号", base_progress=3)
             job.discovery_mode = "入口文章解析"
             parser = WechatArticleParser()
@@ -563,6 +674,7 @@ class ArchiveWebService:
             run_id = self.storage.start_run("web-reverse-input", notes=f"input_url={job.input_url}")
             url_id = self.storage.upsert_article_url(job.input_url, "web_reverse_input", run_id=run_id, source_clue=job.input_url)
             result = fetcher.fetch(job.input_url)
+            self._ensure_automation_active(run_id)
             if result.status == "restricted":
                 self.storage.mark_url_status(url_id, "restricted", result.error_message)
                 self.storage.finish_run(run_id, "blocked", notes=result.error_message)
@@ -599,6 +711,7 @@ class ArchiveWebService:
             job.progress = 10
 
             if article.account_id:
+                self._ensure_automation_active()
                 job.discovery_mode = "URL历史接口"
                 if not self._discover_history(job, account_id, article.account_name, article.account_id, article.wechat_id):
                     automation_cfg = self.config.get("automation", {})
@@ -615,13 +728,14 @@ class ArchiveWebService:
                     )
                     preparation = WechatSessionRefresher().prepare_account(
                         article.account_name,
+                        seed_url=job.input_url,
                         session_fingerprint=session_cache.session_fingerprint,
                         session_timeout_seconds=float(
                             automation_cfg.get("session_ready_timeout_seconds", 15.0)
                         ),
                     )
-                    if not preparation.article_open_attempted:
-                        job.message = f"{job.message}\n自动微信恢复失败：{preparation.message}"
+                    if not preparation.session_verified:
+                        job.message = f"{job.message}\n自动微信恢复未通过验证：{preparation.message}"
                         return
                     job.status = "running"
                     job.phase = "刷新微信会话"
@@ -639,7 +753,9 @@ class ArchiveWebService:
             else:
                 job.warnings.append("入口文章没有暴露 biz，已跳过历史发现")
 
+            self._ensure_automation_active()
             self._crawl_account_staged(job, account_id, article.account_id or article.account_name, expected_biz=article.account_id)
+            self._ensure_automation_active()
             job.phase = "导出 Markdown"
             job.progress = 95
             job.exported_count = MarkdownExporter(self.storage, self.output_dir).export_all(
@@ -648,6 +764,8 @@ class ArchiveWebService:
             )
             range_text = f"；范围从 {job.since_date} 起" if job.since_date else "；范围为全部历史"
             job.mark_done(f"已导出 {job.exported_count} 篇文章；本次保存/更新 {job.crawled_count} 篇{range_text}")
+        except AutomationPausedError:
+            job.mark_paused()
         except Exception as exc:
             job.mark_failed(str(exc))
         finally:
@@ -664,13 +782,16 @@ class ArchiveWebService:
     ) -> None:
         """Run history discovery without re-parsing an old seed article."""
         try:
+            self._ensure_automation_active()
             job.mark_running("使用已确认账号身份", base_progress=5)
             job.account_name = account_name
             job.account_biz = biz
             job.discovery_mode = "URL历史接口"
             if not self._discover_history(job, account_id, account_name, biz, wechat_id):
                 return
+            self._ensure_automation_active()
             self._crawl_account_staged(job, account_id, biz, expected_biz=biz)
+            self._ensure_automation_active()
             job.phase = "导出 Markdown"
             job.progress = 95
             job.exported_count = MarkdownExporter(self.storage, self.output_dir).export_all(
@@ -679,6 +800,8 @@ class ArchiveWebService:
             )
             range_text = f"；范围从 {job.since_date} 起" if job.since_date else "；范围为全部历史"
             job.mark_done(f"已导出 {job.exported_count} 篇文章；本次保存/更新 {job.crawled_count} 篇{range_text}")
+        except AutomationPausedError:
+            job.mark_paused()
         except Exception as exc:
             job.mark_failed(str(exc))
         finally:
@@ -714,8 +837,10 @@ class ArchiveWebService:
                 start_offset=int(history_cfg.get("start_offset", 0) or 0),
                 since_date=job.since_date,
             ):
+                self._ensure_automation_active(run_id)
                 pages += 1
                 for item in items:
+                    self._ensure_automation_active(run_id)
                     article_url_id = self.storage.upsert_article_url(
                         item.public_url,
                         discoverer=discoverer.name,
@@ -733,10 +858,14 @@ class ArchiveWebService:
                     break
             self.storage.finish_run(run_id, "completed", notes=f"pages={pages} discovered={job.discovered_count}")
             return True
+        except AutomationPausedError:
+            raise
         except HistoryDiscoveryError as exc:
             self.storage.finish_run(run_id, "blocked", notes=str(exc))
             job.warnings.append(f"历史发现暂停：{exc}")
-            if is_session_recovery_error(exc):
+            if is_history_access_restriction(exc):
+                job.mark_blocked(f"历史发现因微信验证或访问限制暂停：{exc}")
+            elif is_session_recovery_error(exc):
                 job.mark_needs_session(session_recovery_guidance(account_name))
             else:
                 job.mark_failed(f"历史发现被暂停：{exc}")
@@ -765,6 +894,7 @@ class ArchiveWebService:
             run_mode="web-crawl-fast",
             expected_biz=expected_biz,
         )
+        self._ensure_automation_active()
         self._refresh_unresolved_counts(job, account_id)
         if job.failed_count:
             self._crawl_pending(
@@ -779,9 +909,11 @@ class ArchiveWebService:
                 run_mode="web-crawl-retry",
                 expected_biz=expected_biz,
             )
+            self._ensure_automation_active()
             self._refresh_unresolved_counts(job, account_id)
         if job.unresolved_by_reason.get("unavailable"):
             self._retry_unavailable(job, account_id, account_filter, expected_biz=expected_biz)
+            self._ensure_automation_active()
             self._refresh_unresolved_counts(job, account_id)
 
     def _crawl_pending(
@@ -812,8 +944,10 @@ class ArchiveWebService:
         parser = WechatArticleParser()
         run_id = self.storage.start_run(run_mode, notes=f"account={account_filter} total={len(rows)} retry_failed={retry_failed}")
         for index, row in enumerate(rows, start=1):
+            self._ensure_automation_active(run_id)
             article_url_id = int(row["id"])
             result = fetcher.fetch(row["source_url"])
+            self._ensure_automation_active(run_id)
             if result.status == "restricted":
                 self.storage.mark_url_status(article_url_id, "restricted", result.error_message)
                 self.storage.log("warning", "restricted", result.error_message or "restricted", run_id, account_id=account_id, article_url_id=article_url_id)
@@ -867,6 +1001,7 @@ class ArchiveWebService:
                 self._refresh_unresolved_counts(job, account_id)
             job.mark_progress(index, total=len(rows), base=base, span=span)
             job.message = f"抓取 {index}/{len(rows)}"
+        self._ensure_automation_active(run_id)
         self.storage.finish_run(
             run_id,
             "completed",
@@ -905,7 +1040,9 @@ class ArchiveWebService:
         fetcher = self._build_fetcher(min_delay=0.5, max_delay=1.2, max_retries=1)
         parser = WechatArticleParser()
         for index, row in enumerate(rows, start=1):
+            self._ensure_automation_active(run_id)
             result = fetcher.fetch(row["source_url"])
+            self._ensure_automation_active(run_id)
             if result.status == "restricted":
                 self.storage.mark_url_status(row["id"], "restricted", result.error_message)
                 self.storage.log("warning", "restricted_retry_still_restricted", result.error_message or "restricted", run_id, account_id=account_id, article_url_id=row["id"])
@@ -943,6 +1080,7 @@ class ArchiveWebService:
                 self._refresh_unresolved_counts(job, account_id)
             job.mark_progress(index, total=len(rows), base=85, span=8)
             job.message = f"不可用重试 {index}/{len(rows)}"
+        self._ensure_automation_active(run_id)
         self.storage.finish_run(run_id, "completed", notes=f"retried={len(rows)}")
 
     def _refresh_unresolved_counts(self, job: ArchiveJob, account_id: int) -> None:
@@ -1015,14 +1153,14 @@ class ArchiveWebService:
             seed_url,
             adopt_existing=article_count_before > 0,
             schedule_weekday=int(automation_cfg.get("weekday", 6)),
-            schedule_hour=int(automation_cfg.get("hour", 20)),
+            schedule_hour=int(automation_cfg.get("hour", 21)),
             schedule_minute=int(automation_cfg.get("minute", 0)),
         )
 
     @staticmethod
     def _schedule_payload(rows: list[Any]) -> dict[str, Any]:
         if not rows:
-            return {"weekday": 6, "hour": 20, "minute": 0}
+            return {"weekday": 6, "hour": 21, "minute": 0}
         row = rows[0]
         return {
             "weekday": int(row["schedule_weekday"]),
@@ -1150,6 +1288,12 @@ class ArchiveRequestHandler(SimpleHTTPRequestHandler):
             elif parsed.path.startswith("/api/automation/subscriptions/") and parsed.path.endswith("/run"):
                 subscription_id = int(parsed.path.split("/")[4])
                 self._send_json(self.service.start_subscription_run(subscription_id), status=202)
+            elif parsed.path.startswith("/api/automation/subscriptions/") and parsed.path.endswith("/resume-after-session"):
+                subscription_id = int(parsed.path.split("/")[4])
+                self._send_json(
+                    self.service.resume_subscription_after_session(subscription_id),
+                    status=202,
+                )
             elif parsed.path.startswith("/api/automation/subscriptions/") and parsed.path.endswith("/export-pending"):
                 subscription_id = int(parsed.path.split("/")[4])
                 self._send_json(self.service.start_pending_export(subscription_id), status=202)
@@ -1165,6 +1309,10 @@ class ArchiveRequestHandler(SimpleHTTPRequestHandler):
                         int(payload.get("hour")),
                         int(payload.get("minute")),
                     )
+                )
+            elif parsed.path == "/api/automation/control":
+                self._send_json(
+                    self.service.set_automation_paused(payload.get("paused"))
                 )
             elif parsed.path == "/api/automation/cleanup":
                 self._send_json(self.service.cleanup_preview(execute=bool(payload.get("execute"))))

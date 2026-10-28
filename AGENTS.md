@@ -2,6 +2,17 @@
 
 This repository installs a local macOS WeChat Official Account archiver.
 
+## Current Workflow
+
+Read `docs/CACHE_UPDATE.md` first for repeatable public-cache increments. Prefer
+`main.py cache-update --check`; it does not initialize or modify the product DB.
+New collection is bounded and explicit. Reviewed Word membership is independent
+of full-coverage checkpoints; unknown coverage and old gaps must remain visible.
+Do not re-enable the legacy foreground recoverer or scheduler because a cache
+has no entries. The published default disables automatic jobs and UI preparation;
+existing installations retain their own pause/config and need separate rollout
+acceptance. Key initialization is never implied by an ordinary update request.
+
 ## First Run
 
 When the user asks to install or start the project:
@@ -28,7 +39,7 @@ ask to install or start it.
 - Never commit `data/`, `output/`, `logs/`, SQLite files, Word files, raw article
   corpora, WeChat cache, signed URLs, or session credentials.
 - Use only public content and the user's normal visible WeChat session.
-- Stop on CAPTCHA, login, paywall, rate limit, or access restriction.
+- Pause the affected source and dependent steps on CAPTCHA, login, paywall, rate limit or access restriction; record the reason and continue independent authorized work. A shared session/platform restriction pauses all affected requests; do not switch identities or routes to evade it.
 - Do not disable the user's VPN or weaken macOS privacy controls.
 
 ## Release Gate

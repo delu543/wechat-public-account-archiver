@@ -52,7 +52,7 @@ class AutomationStore:
                     lookback_days INTEGER NOT NULL DEFAULT 7 CHECK(lookback_days >= 0),
                     schedule_weekday INTEGER NOT NULL DEFAULT 6
                         CHECK(schedule_weekday BETWEEN 0 AND 6),
-                    schedule_hour INTEGER NOT NULL DEFAULT 20
+                    schedule_hour INTEGER NOT NULL DEFAULT 21
                         CHECK(schedule_hour BETWEEN 0 AND 23),
                     schedule_minute INTEGER NOT NULL DEFAULT 0
                         CHECK(schedule_minute BETWEEN 0 AND 59),
@@ -119,6 +119,28 @@ class AutomationStore:
                     PRIMARY KEY(batch_id, article_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS automation_cycles (
+                    cycle_key TEXT PRIMARY KEY,
+                    scheduled_for TEXT NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK(status IN ('running', 'needs_attention', 'completed', 'superseded')),
+                    output_folder TEXT NOT NULL,
+                    expected_account_count INTEGER NOT NULL CHECK(expected_account_count >= 0),
+                    completed_account_count INTEGER NOT NULL DEFAULT 0,
+                    attention_account_count INTEGER NOT NULL DEFAULT 0,
+                    exported_count INTEGER NOT NULL DEFAULT 0,
+                    report_path TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS automation_control (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    paused INTEGER NOT NULL DEFAULT 0 CHECK(paused IN (0, 1)),
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_subscriptions_due
                     ON subscriptions(enabled, next_run_at);
                 CREATE INDEX IF NOT EXISTS idx_sync_jobs_status
@@ -127,12 +149,50 @@ class AutomationStore:
                     ON export_batches(account_id, completed_at);
                 """
             )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO automation_control(id, paused, updated_at)
+                VALUES (1, 0, ?)
+                """,
+                (now_iso(),),
+            )
+
+    def automation_control(self) -> dict[str, Any]:
+        with self.storage.connect() as conn:
+            row = conn.execute(
+                "SELECT paused, updated_at FROM automation_control WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            self.init_db()
+            return self.automation_control()
+        return {
+            "paused": bool(row["paused"]),
+            "updated_at": row["updated_at"],
+        }
+
+    def is_automation_paused(self) -> bool:
+        return bool(self.automation_control()["paused"])
+
+    def set_automation_paused(self, paused: bool) -> dict[str, Any]:
+        updated_at = now_iso()
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO automation_control(id, paused, updated_at)
+                VALUES (1, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    paused = excluded.paused,
+                    updated_at = excluded.updated_at
+                """,
+                (int(paused), updated_at),
+            )
+        return {"paused": bool(paused), "updated_at": updated_at}
 
     def adopt_existing_accounts(
         self,
         *,
         schedule_weekday: int = 6,
-        schedule_hour: int = 20,
+        schedule_hour: int = 21,
         schedule_minute: int = 0,
         now: datetime | None = None,
     ) -> list[int]:
@@ -192,13 +252,7 @@ class AutomationStore:
                     ),
                 )
                 subscription_id = int(cursor.lastrowid)
-                article_ids = [
-                    int(row["id"])
-                    for row in conn.execute(
-                        "SELECT id FROM articles WHERE account_id = ? ORDER BY id",
-                        (account_id,),
-                    )
-                ]
+                article_ids = self._unexported_article_ids_with_conn(conn, account_id)
                 self._complete_batch_with_conn(
                     conn,
                     account_id=account_id,
@@ -223,7 +277,7 @@ class AutomationStore:
         enabled: bool = True,
         lookback_days: int = 7,
         schedule_weekday: int = 6,
-        schedule_hour: int = 20,
+        schedule_hour: int = 21,
         schedule_minute: int = 0,
         now: datetime | None = None,
     ) -> sqlite3.Row:
@@ -296,12 +350,7 @@ class AutomationStore:
                     ),
                 )
                 if should_adopt and article_count:
-                    article_ids = [
-                        int(row["id"])
-                        for row in conn.execute(
-                            "SELECT id FROM articles WHERE account_id = ? ORDER BY id", (account_id,)
-                        )
-                    ]
+                    article_ids = self._unexported_article_ids_with_conn(conn, account_id)
                     self._complete_batch_with_conn(
                         conn,
                         account_id=account_id,
@@ -317,6 +366,140 @@ class AutomationStore:
             return conn.execute(
                 "SELECT * FROM subscriptions WHERE account_id = ?", (account_id,)
             ).fetchone()
+
+    def activate_current_baseline(
+        self,
+        *,
+        schedule_weekday: int = 6,
+        schedule_hour: int = 21,
+        schedule_minute: int = 0,
+        enabled: bool = True,
+        now: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Make every successful current article the explicit automation baseline.
+
+        This is intentionally separate from normal startup. It is safe to use
+        when the user chooses a new starting point, but normal restarts must not
+        silently absorb genuinely new, not-yet-exported articles.
+        """
+        current = now or datetime.now().astimezone()
+        with self.storage.connect() as conn:
+            baseline_counts = {
+                int(row["account_id"]): int(row["pending_count"])
+                for row in conn.execute(
+                    """
+                    SELECT ar.account_id, COUNT(*) AS pending_count
+                    FROM articles ar
+                    LEFT JOIN export_batch_articles eba ON eba.article_id = ar.id
+                    WHERE eba.article_id IS NULL
+                    GROUP BY ar.account_id
+                    """
+                )
+            }
+        self.adopt_existing_accounts(
+            schedule_weekday=schedule_weekday,
+            schedule_hour=schedule_hour,
+            schedule_minute=schedule_minute,
+            now=current,
+        )
+        now_text = current.isoformat(timespec="seconds")
+        next_run = self.next_weekly_run(
+            current,
+            schedule_weekday,
+            schedule_hour,
+            schedule_minute,
+        ).isoformat(timespec="seconds")
+        cycle_key = f"activate-current-{current:%Y%m%d-%H%M%S}"
+        activated: list[dict[str, Any]] = []
+        with self.storage.connect() as conn:
+            subscriptions = conn.execute(
+                """
+                SELECT s.id, s.account_id, a.account_name,
+                       COUNT(ar.id) AS article_count,
+                       MAX(ar.id) AS max_article_id,
+                       MAX(ar.publish_time) AS latest_publish_time
+                FROM subscriptions s
+                JOIN accounts a ON a.id = s.account_id
+                LEFT JOIN articles ar ON ar.account_id = s.account_id
+                GROUP BY s.id
+                ORDER BY a.account_name, a.id
+                """
+            ).fetchall()
+            for subscription in subscriptions:
+                account_id = int(subscription["account_id"])
+                baseline_ids = self._unexported_article_ids_with_conn(conn, account_id)
+                if baseline_ids:
+                    self._complete_batch_with_conn(
+                        conn,
+                        account_id=account_id,
+                        cycle_key=cycle_key,
+                        kind="baseline",
+                        article_ids=baseline_ids,
+                        word_path=None,
+                        job_id=None,
+                        period_start=None,
+                        period_end=str(subscription["latest_publish_time"] or "")[:10] or None,
+                        completed_at=now_text,
+                    )
+                conn.execute(
+                    """
+                    UPDATE automation_cycles
+                    SET status = 'superseded', updated_at = ?
+                    WHERE status != 'completed' AND cycle_key IN (
+                        SELECT cycle_key FROM sync_jobs
+                        WHERE subscription_id = ?
+                          AND status NOT IN ('completed', 'superseded')
+                    )
+                    """,
+                    (now_text, subscription["id"]),
+                )
+                conn.execute(
+                    """
+                    UPDATE sync_jobs
+                    SET status = 'superseded', phase = 'superseded', progress = 100,
+                        error_message = '当前成功导入内容已由用户确认为新的自动增量基线',
+                        finished_at = COALESCE(finished_at, ?), updated_at = ?
+                    WHERE subscription_id = ?
+                      AND status NOT IN ('completed', 'superseded')
+                    """,
+                    (now_text, now_text, subscription["id"]),
+                )
+                conn.execute(
+                    """
+                    UPDATE subscriptions
+                    SET enabled = ?, onboarding_mode = 'incremental',
+                        initial_full_completed_at = COALESCE(initial_full_completed_at, ?),
+                        baseline_max_article_id = ?,
+                        schedule_weekday = ?, schedule_hour = ?, schedule_minute = ?,
+                        last_success_at = ?, next_run_at = ?, state = 'active',
+                        last_error = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        int(enabled),
+                        now_text,
+                        subscription["max_article_id"],
+                        schedule_weekday,
+                        schedule_hour,
+                        schedule_minute,
+                        now_text,
+                        next_run,
+                        now_text,
+                        subscription["id"],
+                    ),
+                )
+                activated.append(
+                    {
+                        "subscription_id": int(subscription["id"]),
+                        "account_id": account_id,
+                        "account_name": str(subscription["account_name"]),
+                        "article_count": int(subscription["article_count"] or 0),
+                        "baseline_article_count": baseline_counts.get(account_id, 0),
+                        "latest_publish_time": subscription["latest_publish_time"],
+                        "next_run_at": next_run,
+                    }
+                )
+        return activated
 
     def list_subscriptions(self) -> list[sqlite3.Row]:
         with self.storage.connect() as conn:
@@ -336,6 +519,10 @@ class AutomationStore:
                     """
                 ).fetchall()
             )
+
+    def has_subscriptions(self) -> bool:
+        with self.storage.connect() as conn:
+            return bool(conn.execute("SELECT EXISTS(SELECT 1 FROM subscriptions)").fetchone()[0])
 
     def due_subscriptions(self, now: datetime | None = None) -> list[sqlite3.Row]:
         current = (now or datetime.now().astimezone()).isoformat(timespec="seconds")
@@ -494,6 +681,153 @@ class AutomationStore:
                     ORDER BY j.created_at DESC LIMIT ?
                     """,
                     (limit,),
+                ).fetchall()
+            )
+
+    def latest_resumable_job(self, subscription_id: int) -> sqlite3.Row | None:
+        """Return the newest scheduled job that is waiting for a safe retry."""
+        with self.storage.connect() as conn:
+            return conn.execute(
+                """
+                SELECT j.* FROM sync_jobs j
+                JOIN automation_cycles c ON c.cycle_key = j.cycle_key
+                WHERE j.subscription_id = ? AND j.trigger = 'schedule'
+                  AND j.status IN ('needs_session', 'failed', 'paused')
+                  AND c.status != 'completed'
+                ORDER BY j.scheduled_for DESC, j.created_at DESC
+                LIMIT 1
+                """,
+                (subscription_id,),
+            ).fetchone()
+
+    def begin_cycle(
+        self,
+        cycle_key: str,
+        *,
+        scheduled_for: datetime,
+        output_folder: str,
+        expected_account_count: int,
+    ) -> sqlite3.Row:
+        now_text = now_iso()
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO automation_cycles(
+                    cycle_key, scheduled_for, status, output_folder,
+                    expected_account_count, created_at, updated_at
+                ) VALUES (?, ?, 'running', ?, ?, ?, ?)
+                ON CONFLICT(cycle_key) DO UPDATE SET
+                    expected_account_count = MAX(
+                        automation_cycles.expected_account_count,
+                        excluded.expected_account_count
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    cycle_key,
+                    scheduled_for.isoformat(timespec="seconds"),
+                    output_folder,
+                    max(0, int(expected_account_count)),
+                    now_text,
+                    now_text,
+                ),
+            )
+            return conn.execute(
+                "SELECT * FROM automation_cycles WHERE cycle_key = ?", (cycle_key,)
+            ).fetchone()
+
+    def cycle(self, cycle_key: str) -> sqlite3.Row | None:
+        with self.storage.connect() as conn:
+            return conn.execute(
+                "SELECT * FROM automation_cycles WHERE cycle_key = ?", (cycle_key,)
+            ).fetchone()
+
+    def cycle_jobs(self, cycle_key: str) -> list[sqlite3.Row]:
+        with self.storage.connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT j.*, a.account_name, a.biz, b.word_path
+                    FROM sync_jobs j
+                    JOIN accounts a ON a.id = j.account_id
+                    LEFT JOIN export_batches b
+                      ON b.job_id = j.id AND b.status = 'completed'
+                    WHERE j.cycle_key = ? AND j.trigger = 'schedule'
+                    ORDER BY a.account_name, a.id
+                    """,
+                    (cycle_key,),
+                ).fetchall()
+            )
+
+    def update_cycle_progress(self, cycle_key: str) -> sqlite3.Row:
+        cycle = self.cycle(cycle_key)
+        if cycle is None:
+            raise KeyError(f"automation cycle not found: {cycle_key}")
+        jobs = self.cycle_jobs(cycle_key)
+        completed = sum(row["status"] == "completed" for row in jobs)
+        attention = sum(row["status"] in ("failed", "blocked", "needs_session") for row in jobs)
+        exported = sum(int(row["exported_count"] or 0) for row in jobs)
+        status = "needs_attention" if attention else "running"
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                UPDATE automation_cycles
+                SET status = ?, completed_account_count = ?,
+                    attention_account_count = ?, exported_count = ?, updated_at = ?
+                WHERE cycle_key = ? AND status != 'completed'
+                """,
+                (status, completed, attention, exported, now_iso(), cycle_key),
+            )
+            return conn.execute(
+                "SELECT * FROM automation_cycles WHERE cycle_key = ?", (cycle_key,)
+            ).fetchone()
+
+    def mark_cycle_completed(self, cycle_key: str, *, report_path: str) -> sqlite3.Row:
+        cycle = self.cycle(cycle_key)
+        if cycle is None:
+            raise KeyError(f"automation cycle not found: {cycle_key}")
+        jobs = self.cycle_jobs(cycle_key)
+        expected = int(cycle["expected_account_count"])
+        if len(jobs) < expected or any(row["status"] != "completed" for row in jobs):
+            raise ValueError("automation cycle still has unfinished accounts")
+        completed_at = now_iso()
+        exported = sum(int(row["exported_count"] or 0) for row in jobs)
+        with self.storage.connect() as conn:
+            conn.execute(
+                """
+                UPDATE automation_cycles
+                SET status = 'completed', completed_account_count = ?,
+                    attention_account_count = 0, exported_count = ?,
+                    report_path = ?, completed_at = COALESCE(completed_at, ?),
+                    updated_at = ?
+                WHERE cycle_key = ?
+                """,
+                (len(jobs), exported, report_path, completed_at, completed_at, cycle_key),
+            )
+            return conn.execute(
+                "SELECT * FROM automation_cycles WHERE cycle_key = ?", (cycle_key,)
+            ).fetchone()
+
+    def latest_completed_cycle(self) -> sqlite3.Row | None:
+        with self.storage.connect() as conn:
+            return conn.execute(
+                """
+                SELECT * FROM automation_cycles
+                WHERE status = 'completed'
+                ORDER BY completed_at DESC, scheduled_for DESC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    def open_cycles(self) -> list[sqlite3.Row]:
+        with self.storage.connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM automation_cycles
+                    WHERE status NOT IN ('completed', 'superseded')
+                    ORDER BY scheduled_for, cycle_key
+                    """
                 ).fetchall()
             )
 
@@ -718,3 +1052,22 @@ class AutomationStore:
             ((batch_id, article_id, ordinal) for ordinal, article_id in enumerate(unique_ids, 1)),
         )
         return batch_id
+
+    @staticmethod
+    def _unexported_article_ids_with_conn(
+        conn: sqlite3.Connection,
+        account_id: int,
+    ) -> list[int]:
+        return [
+            int(row["id"])
+            for row in conn.execute(
+                """
+                SELECT ar.id
+                FROM articles ar
+                LEFT JOIN export_batch_articles eba ON eba.article_id = ar.id
+                WHERE ar.account_id = ? AND eba.article_id IS NULL
+                ORDER BY ar.id
+                """,
+                (account_id,),
+            )
+        ]

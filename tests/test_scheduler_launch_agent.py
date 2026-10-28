@@ -70,8 +70,11 @@ def test_status_agent_targets_installed_native_app(tmp_path):
     ]
 
 
-def test_status_app_ready_preserves_existing_authorized_bundle(tmp_path):
+def test_status_app_ready_preserves_only_bundle_built_from_current_source(tmp_path, monkeypatch):
     project = tmp_path / "project"
+    source = project / "wechat_crawler" / "macos_status" / "StatusApp.swift"
+    source.parent.mkdir(parents=True)
+    source.write_text("// current status app", encoding="utf-8")
     manager = LaunchAgentManager(project, product_root=tmp_path / "product")
     executable = manager.status_app_path / "Contents" / "MacOS" / "WeChatArchiveStatus"
     executable.parent.mkdir(parents=True)
@@ -79,9 +82,27 @@ def test_status_app_ready_preserves_existing_authorized_bundle(tmp_path):
     executable.chmod(0o755)
     info_path = manager.status_app_path / "Contents" / "Info.plist"
     with info_path.open("wb") as handle:
-        plistlib.dump({"CFBundleIdentifier": STATUS_LABEL}, handle)
+        plistlib.dump(
+            {
+                "CFBundleIdentifier": STATUS_LABEL,
+                "WeChatArchiveSourceSHA256": manager._status_source_hash(),
+            },
+            handle,
+        )
+
+    class SignatureResult:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr(
+        "wechat_crawler.launch_agent.subprocess.run",
+        lambda *args, **kwargs: SignatureResult(),
+    )
 
     assert manager._status_app_ready() is True
+    source.write_text("// updated status app", encoding="utf-8")
+    assert manager._status_app_ready() is False
 
 
 def test_status_app_never_requests_accessibility_permission():
@@ -96,4 +117,22 @@ def test_status_app_never_requests_accessibility_permission():
     assert "kAXTrustedCheckOptionPrompt" not in source
     assert "openPublicAccountArticle" not in source
     assert "starting authorized foreground recovery" in source
-    assert "startForegroundSubscription" in source
+    assert "startForegroundSessionPreparation" in source
+    assert "UNUserNotificationCenter" in source
+    assert "已经弄好了" in source
+    assert '"output_folder"' in source
+    assert '"automation-prepare-session"' in source
+    assert '"--resume-needs-session"' not in source
+    assert '"\\(subscriptionId)/resume-after-session"' in source
+    assert "NSStatusItem.squareLength" in source
+    assert "statusItem.isVisible = true" in source
+    assert "NSWorkspace.didWakeNotification" in source
+    assert '"didShowVisibilityPopover-v2"' in source
+    assert "maxSessionPreparationAttempts = 3" in source
+    assert "sessionPreparationCooldown: TimeInterval = 60" in source
+    assert "completion(task.terminationStatus == 0)" in source
+    assert 'NSButton(title: "暂停全部爬取"' in source
+    assert '"继续全部爬取"' in source
+    assert "/api/automation/control" in source
+    assert "foregroundSessionProcess" in source
+    assert "cancelForegroundSessionPreparation" in source

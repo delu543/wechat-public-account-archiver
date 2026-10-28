@@ -6,6 +6,7 @@ import re
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
@@ -71,18 +72,28 @@ class WechatCacheDiscoverer:
         target_wechat_id: str | None = None,
         max_file_bytes: int = 20 * 1024 * 1024,
         runner=subprocess.run,
+        session_scan_timeout_seconds: float = 8.0,
     ) -> None:
         self.root_dir = Path(root_dir).expanduser()
         self.target_biz = target_biz
         self.target_wechat_id = target_wechat_id
         self.max_file_bytes = max_file_bytes
         self._run = runner
+        self.session_scan_timeout_seconds = max(0.0, float(session_scan_timeout_seconds))
 
     def discover(self, *, stop_when_session_fields: bool = False) -> list[CacheArticleCandidate]:
         candidates: dict[str, CacheArticleCandidate] = {}
+        # Session polling must not walk years of cache files between UI state
+        # checks. Full public-URL discovery keeps its existing exhaustive scan.
+        deadline = (
+            time.monotonic() + self.session_scan_timeout_seconds
+            if stop_when_session_fields else None
+        )
         if not self.root_dir.exists():
             return []
         for path in self._iter_files():
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             data = self._read_bytes(path)
             if not data:
                 continue

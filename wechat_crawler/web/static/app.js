@@ -3,6 +3,7 @@ const state = {
   selectedArticleId: null,
   activeJobId: null,
   activeAutomationJobId: null,
+  automationPaused: false,
   pollTimer: null,
   automationTimer: null,
   articleOffset: 0,
@@ -129,6 +130,7 @@ function phaseLabel(value) {
     completed: "已完成",
     failed: "失败",
     needs_session: "等待微信会话",
+    paused: "已暂停",
     blocked: "已暂停",
   };
   return labels[value] || value || "--";
@@ -158,12 +160,13 @@ async function loadAutomation() {
   renderOverview(overview);
   renderSubscriptions(subscriptions);
   renderExports(batches);
-  const running = jobs.find((job) => !["completed", "failed", "blocked", "needs_session"].includes(job.status));
+  const running = jobs.find((job) => !["completed", "failed", "blocked", "needs_session", "paused", "superseded"].includes(job.status));
   const selected = jobs.find((job) => job.job_id === state.activeAutomationJobId) || running || jobs[0];
   if (selected && !state.activeJobId) setProgress(selected);
 }
 
 function renderOverview(overview) {
+  state.automationPaused = Boolean(overview.automation_paused);
   nodes.databasePath.textContent = `Word：${overview.output_dir} · 数据：${overview.database_path}`;
   nodes.databasePath.title = nodes.databasePath.textContent;
   nodes.subscriptionMetric.textContent = `${overview.enabled_count}/${overview.subscription_count}`;
@@ -174,14 +177,16 @@ function renderOverview(overview) {
   const windowReady = overview.wechat_window && overview.wechat_window.state === "ready";
   const screenLocked = overview.wechat_window && overview.wechat_window.state === "screen_locked";
   const sessionReady = cacheReady && windowReady;
-  nodes.schedulerBadge.textContent = overview.scheduler_running
-    ? sessionReady ? "自动运行中 · 微信已识别" : screenLocked ? "自动运行中 · Mac 已锁定" : "自动运行中 · 微信待就绪"
-    : "自动调度未启动";
+  nodes.schedulerBadge.textContent = overview.automation_paused
+    ? "全部爬取已暂停"
+    : overview.scheduler_running
+      ? sessionReady ? "自动运行中 · 微信已识别" : screenLocked ? "自动运行中 · Mac 已锁定" : "自动运行中 · 微信待就绪"
+      : "自动调度未启动";
   nodes.schedulerBadge.title = [
     overview.wechat_window && overview.wechat_window.message,
     overview.wechat_session_cache && overview.wechat_session_cache.message,
   ].filter(Boolean).join("；");
-  nodes.schedulerBadge.className = `status-badge ${overview.scheduler_running && sessionReady ? "success" : "warning"}`;
+  nodes.schedulerBadge.className = `status-badge ${!overview.automation_paused && overview.scheduler_running && sessionReady ? "success" : "warning"}`;
   const schedule = overview.schedule || {};
   nodes.scheduleWeekday.value = String(schedule.weekday ?? 6);
   nodes.scheduleTime.value = `${String(schedule.hour ?? 20).padStart(2, "0")}:${String(schedule.minute ?? 0).padStart(2, "0")}`;
@@ -210,6 +215,8 @@ function renderSubscriptions(subscriptions) {
     run.type = "button";
     run.className = "table-action";
     run.textContent = "立即同步";
+    run.disabled = state.automationPaused;
+    if (state.automationPaused) run.title = "请先在菜单栏插件中点击“继续”";
     run.addEventListener("click", () => runSubscription(item.id, run));
     if (item.pending_export_count > 0) {
       const exportPending = document.createElement("button");
@@ -341,7 +348,7 @@ async function pollAutomationJob() {
   if (!state.activeAutomationJobId) return;
   const job = await api(`/api/automation/jobs/${state.activeAutomationJobId}`);
   setProgress(job);
-  if (["completed", "failed", "blocked", "needs_session"].includes(job.status)) {
+  if (["completed", "failed", "blocked", "needs_session", "superseded"].includes(job.status)) {
     clearInterval(state.automationTimer);
     state.automationTimer = null;
     await Promise.all([loadAutomation(), loadAccounts()]);

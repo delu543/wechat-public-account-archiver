@@ -1,189 +1,114 @@
-# 公众号自动爬虫设计
+# 微信公众号公开内容本地归档
 
-一个面向 macOS 的微信公众号公开文章归档工具。输入公众号任意一篇公开文章链接，系统会识别账号、发现公开历史文章、去重抓取正文，并按公众号生成 Markdown 和 Word。
+面向 macOS 的公开文章和短内容归档：精确账号隔离、增量去重、断点保留、每个公众号一份带时间的 Word。
 
-项目只处理公开可访问内容，不绕过登录、验证码、付费墙或微信风控。
+**当前已验证的是被动缓存路线，不是无条件的全自动全历史抓取。** 微信写入的公开缓存可被批量累计；缓存未包含的新列表不能由旧 seed 链接凭空补出。完整发表覆盖、真实来源可用性和插件部署须分别验收。
 
-## 主要能力
+## 推荐工作流
 
-- 单篇公开文章链接扩展为同一公众号历史归档
-- 新公众号首次全量、已有公众号每周增量
-- 精确 `biz` 账号隔离，避免同名公众号混档
-- URL、文章身份、正文 hash、Word 批次四层去重
-- SQLite 断点续跑和失败原因记录
-- 每个公众号独立 Word，零新增时不生成空文档
-- 本地控制台、菜单栏状态工具、每周自动运行
-- 验证码、登录、限频和不可访问页面自动暂停并记录
+在实际产品工作区使用已配置的 Python 环境：
 
-## 系统要求
+```sh
+# 默认只读检查：已有暂存、产品节点、已验收 Word 收据
+.venv/bin/python main.py cache-update --check
 
-- macOS 13 或更新版本
-- Mac 微信 4.x，且用户已正常登录
-- Python 3.9 或更新版本
-- Xcode Command Line Tools（用于编译菜单栏工具）
-
-缺少 Command Line Tools 时运行：
-
-```bash
-xcode-select --install
+# 已有正文直接整理；明确接受未知完整覆盖
+.venv/bin/python main.py cache-update --export --accept-discovered
 ```
 
-## 在 Codex 中使用
+没有新缓存时，先启动有限收集，再正常浏览**受影响账号**的主页，不必逐篇打开：
 
-1. 在 Codex 中打开本仓库。
-2. 对 Codex 说：`安装并启动这个项目`。
-3. Codex 会读取根目录的 `AGENTS.md` 和项目内 Skill，执行预检、测试及安装。
+```sh
+.venv/bin/python main.py cache-update --collect --seconds 600 --export --accept-discovered
+```
 
-安装完成后可以直接调用项目内 Skill 的两个固定动作：
+仅本次独立收集明确获准时，可增加 `--allow-local-stage-while-paused`。它不解除后台暂停；暂停状态变化会停止提交。命令不操作微信、不读取聊天、不获取/重放客户端签名、不发网络请求。
+
+Word 先通过标题、正文、永久链接和成员核验，状态为 `awaiting_render_review`。交付者实际渲染检查后登记：
+
+```sh
+.venv/bin/python main.py cache-update --confirm-delivery '<返回的批次目录>' --render-reviewed
+```
+
+该标记不是渲染器，也不能替代检查。登记后的真实成员用于下一轮去重；不推进未证实的完整归档节点，不吞掉旧缺口。无需要求用户为正常文档 QA 再手动点确认。
+
+完整配置、历史批次迁移、日期/排除账号/中断恢复见 [缓存增量使用说明](docs/CACHE_UPDATE.md)。
+
+## 需要多少人工
+
+- 数据已经在缓存或暂存中：读取、累计、去重、分号 Word、收据核对可自动完成。
+- 新目录没有进入缓存：仍可能需要用户正常打开对应主页并向下加载到提示日期。程序先收集，只提示缺数据的号；不能保证每周零人工。
+- 已绑定的公众号推送库是另一条条件路线，但专用初始化/HMAC/真实覆盖尚未完整验收，且推送可能缺“发表未群发”。不在缓存不足时自动 setup。见 [条件推送路线](docs/PASSIVE_WEEKLY.md)。
+- 全历史需要可验证的分页目录或实际已取得的缓存。当前没有已验收的完整历史替代源；只含长文章的目录不能替代含短内容的全量目标。
+
+原 `reverse`、`history-sync`、`history-cache-sync`、控制台与菜单栏代码保留。旧客户端会话分页/前台恢复属于条件功能，不是当前推荐入口的自动兜底；不要因它们存在就重复点击微信或重试受限请求。
+
+## Codex Skills
+
+仓库内 `.agents/skills/` 提供两个可独立使用的 Skill：
 
 ```text
-$wechat-public-account-subscriptions 添加公众号：https://mp.weixin.qq.com/s/...；从 2026-08-04 开始。
 $wechat-public-account-subscriptions 更新全部公众号到今天。
+$wechat-public-account-subscriptions 添加公众号：https://mp.weixin.qq.com/s/...；从 YYYY-MM-DD 开始。
+$wechat-public-account-history 归档这个公众号的全部历史。
 ```
 
-第一次添加时提供一篇公开文章链接和开始日期（或明确“全部历史”）。绑定完成后，批量更新会读取保存的 seed URL、精确 `biz` 和上次成功节点，不再要求逐个提供新链接。
+新账号需要公开 seed、精确身份以及开始日期/全部历史选择；已登记的号复用现有订阅，不需每周重新给链接。Skills 会核对当前来源及数据证据，不把旧接口或固定点击序列当作强制步骤。遇到真实登录/验证/限制必须停受影响来源。
 
-Codex 可以通过仓库内的 `AGENTS.md` 获得项目操作说明，但出于本机安全边界，仅仅查看 GitHub 页面不会静默执行程序；仍需要用户明确发出一次安装指令。参见 [OpenAI 对 AGENTS.md 的说明](https://openai.com/index/introducing-codex/)。
+## 安装与配置
 
-## 命令行安装
+macOS 13+，Python 3.9+；菜单栏构建另需 Xcode Command Line Tools。只运行缓存 CLI 不需要安装后台服务。仅在用户明确要求安装时创建环境：
 
-```bash
-git clone "https://github.com/delu543/wechat-public-account-archiver.git" "公众号自动爬虫设计"
-cd "公众号自动爬虫设计"
-./install.sh
-```
-
-安装器会：
-
-1. 检查 macOS、Python、Swift 编译器和微信。
-2. 创建项目虚拟环境并安装依赖。
-3. 运行完整测试。
-4. 安装本地后台服务和菜单栏“归档”工具。
-5. 打开 `http://127.0.0.1:8765`。
-
-只做环境预检：
-
-```bash
-./install.sh --check
-```
-
-安装但不自动打开浏览器：
-
-```bash
-./install.sh --no-open
-```
-
-## 日常使用
-
-安装后，macOS 菜单栏会出现“归档”：
-
-- **打开控制台**：查看订阅、进度、预计剩余时间和失败原因。
-- **打开输出目录**：在 Finder 中查看生成的 Word。
-- **立即同步**：手动检查某个公众号。
-- **暂停/启用**：控制单个账号是否参加每周任务。
-
-默认每周日 20:00 自动运行。控制台网页可以关闭，后台服务不会停止。计划运行时需要：
-
-- Mac 已登录且未锁屏
-- 微信已登录
-- 网络和用户自己的 VPN 保持正常
-
-如果电脑在计划时间关机或休眠，登录后调度器会补跑；涉及微信前台操作时，锁屏状态会等待而不会操作登录界面。
-
-## 添加公众号
-
-在控制台粘贴该公众号任意一篇公开文章链接：
-
-- 起始日期留空：首次抓取全部可发现历史
-- 填写日期：只处理该日期及以后
-- 首次完成后：自动转为每周增量
-
-旧文章链接可以作为长期种子，不要求用户每周提供新链接。系统先尝试保存的 URL 和精确 `biz`；仅在公开历史会话失效时，才使用已授权的 Mac 微信可见会话恢复。
-
-自动增量每次都从公众号最新历史页开始，向后扫描到上次保存的日期截止点，不沿用命令行调试时的旧分页偏移。需要恢复微信会话时，系统把保存的公开文章链接放入微信主窗口的新搜索框，打开顶部“访问网页”结果并等待正文加载；存在有效 seed URL 时不会重新输入公众号名称。它不会使用 `Command-F`，也不会搜索或读取历史聊天记录。只有检测到该公众号的会话指纹确实变化后，才继续历史分页。
-
-## 输出位置
-
-长期数据保存在：
-
-```text
-~/Library/Application Support/WeChatPublicAccountArchive/
-  data/archive.sqlite
-  output/
-    weekly/
-      YYYY-MM-DD/
-        公众号名称_本周增量.docx
-        本周公众号增量汇总.docx
-  logs/
-```
-
-已有账号只把尚未进入成功 Word 批次的新文章写入下一份文档。数据库、正文 hash 和批次成员关系共同保证重跑不会重复输出。
-
-## 本地控制台
-
-地址：`http://127.0.0.1:8765`
-
-控制台提供：
-
-- 公众号文件夹和文章阅读
-- 周计划设置
-- 当前阶段、进度和 ETA
-- 发现、重叠、新增、失败、受限、Word 输出计数
-- 持久化失败原因
-- 最近 Word 下载
-- Finder 输出目录入口
-- 可再生成缓存清理
-
-## 更新与卸载
-
-更新代码后重新运行：
-
-```bash
-git pull
-./install.sh
-```
-
-安装器保留数据库、Word 和已有菜单栏 App 身份，避免升级时反复触发 macOS 授权。
-
-停止自动服务但保留数据：
-
-```bash
-./uninstall.sh
-```
-
-## 开发与测试
-
-```bash
+```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 .venv/bin/python -m pytest -q
 ```
 
-代码结构：
+配置来自 `config.yaml`；私人迁移路径、排除账号、冻结交付节点请在本地配置，不能提交到公开仓库。已有数据库不能用空白样例覆盖。默认数据目录：
 
 ```text
-wechat_crawler/
-  crawler/             抓取、解析、发现、存储、导出
-  web/                 本地控制台
-  macos_status/        菜单栏状态工具
-  automation_store.py  自动任务和 Word 批次
-  weekly_sync.py       全量/增量调度
-  launch_agent.py      macOS 登录自启
-tests/
-.agents/skills/        项目内 Codex Skill
+~/Library/Application Support/WeChatPublicAccountArchive/
+  data/archive.sqlite
+  output/cache-updates/
+    stages/
+    deliveries/batch-日期-指纹/
+      公众号_起点至终点_已发现增量_标识.docx
+      plan.json
+      delivery-manifest.json
+      verification.json     # 实际渲染验收后才生成
 ```
 
-## 隐私与边界
+本发布样例关闭定时任务与自动前台会话准备，不会自动恢复用户原有暂停。源码更新不等于安装副本更新；切换旧插件/每周日21:00定时运行，还要另验安装路径、暂停按钮、实际新数据和通知打开的目录。
 
-- 不上传本机数据库、文章归档、日志或微信缓存
-- 不保存或输出微信签名参数和会话凭据
-- 不截图或规避微信的隐私画面保护
-- 不自动输入密码或解锁 Mac
-- 不破解验证码、登录、付费或访问限制
-- 默认只监听本机 `127.0.0.1`
+如用户另外请求安装本地控制台/菜单栏，可先只做预检：
 
-详细能力边界见 [docs/CAPABILITY_MAP.md](docs/CAPABILITY_MAP.md)。
+```sh
+./install.sh --check
+```
+
+`./install.sh` 会安装依赖并启动本地服务，不能在仅更新源码或查看仓库时运行。控制台仅监听 `127.0.0.1:8765`。新缓存入口当前是 CLI，未自动接管旧“立即同步”按钮。历史输出仍保留原目录，不迁移或删除。
+
+## 工程与验证
+
+```sh
+.venv/bin/python -m pytest -q
+./install.sh --check
+```
+
+- 公开缓存支持 bounded Snappy/V8、LevelDB 日志/SST/内联值以及跨窗口累计，按精确 biz/微信号/永久身份保存。
+- 收据逐成员/文件哈希去重，已交付正文变化作为版本缺口，不覆盖旧 Word。
+- 未完成批次优先恢复；新发现留给下一批。没有合格内容不生成空文档，未知不记为无更新。
+- 真实旧批次只读核验与合成回归分开，源覆盖、排版、安装和自动调度不是同一层验收。
+
+详见 [能力图](docs/CAPABILITY_MAP.md)、[读取格式及覆盖验收](docs/PASSIVE_CACHE_CAPTURE.md)。
+
+## 隐私与发布边界
+
+只处理用户授权的公开内容。登录、验证码、付费墙、限频或访问限制会停止受影响来源及共享依赖；其余独立本地整理可继续。不得换身份、代理或入口绕过限制。
+
+不上传文章库、Word、私有配置、微信缓存或凭据；不自动取密钥、不屏幕保护绕过、不解锁 Mac、不读取历史聊天。数据库、旧输出与任务证据默认保留，清理/部署/初始化均需各自授权。
 
 ## 许可证
 
-MIT
+MIT。缓存格式适配为独立实现，来源和采用边界见格式说明；未复制或打包非商业限制仓库的代码。

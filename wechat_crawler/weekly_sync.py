@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -15,6 +16,9 @@ from .crawler.normalizer import safe_path_part
 from .crawler.storage import Storage
 from .incremental_word import IncrementalWordExporter
 from .macos_wechat import WechatSessionRefresher
+
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -135,9 +139,11 @@ class ExistingCrawlerAdapter:
                     automation_cfg.get("session_ready_timeout_seconds", 15.0)
                 ),
             )
-            if preparation.article_open_attempted:
+            if preparation.session_verified:
                 progress("preflight", 16, {})
                 runtime = execute()
+            else:
+                runtime.message = f"{runtime.message}\n自动微信恢复未通过验证：{preparation.message}"
         return CrawlResult(
             status=runtime.status,
             message=runtime.message,
@@ -182,9 +188,35 @@ class WeeklySyncRunner:
         self.word_exporter = word_exporter or IncrementalWordExporter()
         self.cleanup = ArchiveCleanup(storage, self.output_dir)
 
+    def _ensure_automation_active(self) -> None:
+        if self.automation.is_automation_paused():
+            raise RuntimeError("全部爬取已暂停；请先在菜单栏插件中点击“继续”")
+
     def run_job(self, job_id: str) -> SyncResult:
+        self._ensure_automation_active()
         try:
             return self._run_job_impl(job_id)
+        except Exception as exc:
+            LOG.exception("weekly account job failed: %s", job_id)
+            job = self.automation.job(job_id)
+            if job is None:
+                raise
+            message = str(exc).strip() or exc.__class__.__name__
+            self.automation.update_job(
+                job_id,
+                status="failed",
+                phase="failed",
+                error_message=message,
+                finished=True,
+            )
+            self.automation.defer_subscription(
+                int(job["subscription_id"]),
+                "error",
+                message,
+                delay=timedelta(hours=24),
+            )
+            _subscription, account = self._context(job)
+            return SyncResult(job_id, str(account["account_name"]), "failed", 0, None, message)
         finally:
             try:
                 self.cleanup.prune(execute=True, include_raw_html=False)
@@ -228,6 +260,23 @@ class WeeklySyncRunner:
         }
         checkpoint = {"unresolved_by_reason": dict(outcome.unresolved_by_reason)}
         self.automation.update_job(job_id, counts=counts, checkpoint=checkpoint)
+        if outcome.status == "paused":
+            self.automation.update_job(
+                job_id,
+                status="paused",
+                phase="paused",
+                counts=counts,
+                checkpoint=checkpoint,
+                error_message=outcome.message or "全部爬取已由用户暂停",
+            )
+            return SyncResult(
+                job_id,
+                account_name,
+                "paused",
+                0,
+                None,
+                outcome.message or "全部爬取已由用户暂停",
+            )
         if outcome.status == "needs_session":
             self.automation.update_job(
                 job_id,
@@ -246,6 +295,25 @@ class WeeklySyncRunner:
                 delay=timedelta(hours=retry_hours),
             )
             return SyncResult(job_id, account_name, "needs_session", 0, None, outcome.message)
+        if outcome.status == "blocked":
+            self.automation.update_job(
+                job_id,
+                status="blocked",
+                phase="blocked",
+                counts=counts,
+                checkpoint=checkpoint,
+                error_message=outcome.message,
+                finished=True,
+            )
+            # All current subscriptions use the same local WeChat public
+            # session. A verification/access restriction is not evidence that
+            # another account can safely retry through that shared session.
+            for affected in self.automation.list_subscriptions():
+                if affected["enabled"] or int(affected["id"]) == int(subscription["id"]):
+                    self.automation.set_subscription_state(
+                        int(affected["id"]), "blocked", f"共享微信公开会话已暂停：{outcome.message}"
+                    )
+            return SyncResult(job_id, account_name, "blocked", 0, None, outcome.message)
         if outcome.status != "completed":
             self.automation.update_job(
                 job_id,
@@ -327,11 +395,14 @@ class WeeklySyncRunner:
             folder = self._weekly_folder(job)
             mode = str(job["mode"])
             suffix = "首次全量" if mode == "initial_full" else "本周增量"
-            filename = f"{safe_path_part(account_name, 'account')}_{suffix}.docx"
+            period = "" if mode == "initial_full" else f"_{self._weekly_period_label(job['scheduled_for'])}"
+            filename = f"{safe_path_part(account_name, 'account')}{period}_{suffix}.docx"
             target = folder / filename
             if target.exists():
                 cycle_suffix = safe_path_part(str(job["cycle_key"]), "cycle")
-                target = folder / f"{safe_path_part(account_name, 'account')}_{suffix}_{cycle_suffix}.docx"
+                target = folder / (
+                    f"{safe_path_part(account_name, 'account')}{period}_{suffix}_{cycle_suffix}.docx"
+                )
             word_path = self.word_exporter.export_account(
                 candidates,
                 target,
@@ -366,23 +437,57 @@ class WeeklySyncRunner:
         )
 
     def run_due(self, *, now: datetime | None = None) -> list[SyncResult]:
+        if self.automation.is_automation_paused():
+            return []
         current = now or datetime.now().astimezone()
         cycle_key = self.automation.cycle_key(current)
+        subscriptions = self.automation.due_subscriptions(current)
         results: list[SyncResult] = []
-        for subscription in self.automation.due_subscriptions(current):
-            job = self.automation.create_job(
+        jobs: list[Mapping[str, Any]] = []
+        for subscription in subscriptions:
+            resumable = self.automation.latest_resumable_job(int(subscription["id"]))
+            job = resumable or self.automation.create_job(
                 int(subscription["id"]),
                 cycle_key,
                 trigger="schedule",
                 scheduled_for=current,
             )
-            if job["status"] not in ("completed", "blocked", "failed"):
+            jobs.append(job)
+        grouped_jobs: dict[str, list[Mapping[str, Any]]] = {}
+        for job in jobs:
+            grouped_jobs.setdefault(str(job["cycle_key"]), []).append(job)
+        for prepared_cycle_key, prepared_jobs in grouped_jobs.items():
+            if self.automation.cycle(prepared_cycle_key) is not None:
+                continue
+            scheduled_for = datetime.fromisoformat(str(prepared_jobs[0]["scheduled_for"]))
+            output_folder = self.output_dir / "weekly" / scheduled_for.date().isoformat()
+            self.automation.begin_cycle(
+                prepared_cycle_key,
+                scheduled_for=scheduled_for,
+                output_folder=str(output_folder.resolve()),
+                expected_account_count=len(prepared_jobs),
+            )
+        for job in jobs:
+            if self.automation.is_automation_paused():
+                break
+            subscription, account = self._context(job)
+            if subscription["state"] == "blocked" and job["status"] != "completed":
+                message = str(subscription["last_error"] or "共享微信公开会话访问受限")
+                self.automation.update_job(
+                    str(job["id"]), status="blocked", phase="blocked", error_message=message, finished=True
+                )
+                results.append(SyncResult(str(job["id"]), str(account["account_name"]), "blocked", 0, None, message))
+                continue
+            if job["status"] not in ("completed", "blocked"):
                 results.append(self.run_job(str(job["id"])))
-        if results:
-            self._write_run_report(current, cycle_key, results)
+        cycle_keys = {str(job["cycle_key"]) for job in jobs}
+        cycle_keys.update(str(row["cycle_key"]) for row in self.automation.open_cycles())
+        for pending_cycle_key in sorted(cycle_keys):
+            self._finalize_cycle(pending_cycle_key)
         return results
 
     def run_subscription_now(self, subscription_id: int) -> SyncResult:
+        self._ensure_automation_active()
         current = datetime.now().astimezone()
         cycle = f"manual-{current:%Y%m%d-%H%M%S}-{int(time.time_ns() % 1_000_000):06d}"
         job = self.automation.create_job(
@@ -392,6 +497,15 @@ class WeeklySyncRunner:
             scheduled_for=current,
         )
         return self.run_job(str(job["id"]))
+
+    def resume_latest_scheduled(self, subscription_id: int) -> SyncResult:
+        self._ensure_automation_active()
+        job = self.automation.latest_resumable_job(subscription_id)
+        if job is None:
+            return self.run_subscription_now(subscription_id)
+        result = self.run_job(str(job["id"]))
+        self._finalize_cycle(str(job["cycle_key"]))
+        return result
 
     def _context(self, job: Mapping[str, Any]) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
         with self.storage.connect() as conn:
@@ -417,12 +531,43 @@ class WeeklySyncRunner:
         folder.mkdir(parents=True, exist_ok=True)
         return folder
 
+    @staticmethod
+    def _weekly_period_label(scheduled_for: Any) -> str:
+        scheduled = datetime.fromisoformat(str(scheduled_for))
+        period_end = scheduled.date()
+        period_start = period_end - timedelta(days=6)
+        return f"{period_start:%Y-%m-%d}至{period_end:%Y-%m-%d}"
+
+    def _finalize_cycle(self, cycle_key: str) -> None:
+        cycle = self.automation.cycle(cycle_key)
+        if cycle is None or cycle["status"] == "completed":
+            return
+        jobs = self.automation.cycle_jobs(cycle_key)
+        expected = int(cycle["expected_account_count"])
+        if len(jobs) < expected or any(row["status"] != "completed" for row in jobs):
+            self.automation.update_cycle_progress(cycle_key)
+            return
+        results = [
+            SyncResult(
+                job_id=str(row["id"]),
+                account_name=str(row["account_name"]),
+                status="completed",
+                exported_count=int(row["exported_count"] or 0),
+                word_path=str(row["word_path"]) if row["word_path"] else None,
+                message="本轮增量已完成",
+            )
+            for row in jobs
+        ]
+        scheduled_for = datetime.fromisoformat(str(cycle["scheduled_for"]))
+        report_path = self._write_run_report(scheduled_for, cycle_key, results)
+        self.automation.mark_cycle_completed(cycle_key, report_path=str(report_path.resolve()))
+
     def _write_run_report(
         self,
         current: datetime,
         cycle_key: str,
         results: list[SyncResult],
-    ) -> None:
+    ) -> Path:
         folder = self.output_dir / "weekly" / current.date().isoformat()
         folder.mkdir(parents=True, exist_ok=True)
         result_dicts = [item.to_dict() for item in results]
@@ -436,7 +581,8 @@ class WeeklySyncRunner:
         temporary.replace(folder / "run-report.json")
         self.word_exporter.export_summary(
             result_dicts,
-            folder / "本周公众号增量汇总.docx",
+            folder / f"{self._weekly_period_label(current)}_本周公众号增量汇总.docx",
             cycle_key=cycle_key,
-            generated_at=current,
+            generated_at=datetime.now().astimezone(),
         )
+        return folder / "run-report.json"

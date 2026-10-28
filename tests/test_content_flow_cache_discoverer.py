@@ -9,10 +9,10 @@ from wechat_crawler.crawler.discoverers.content_flow_cache_discoverer import (
 
 
 def test_content_flow_cache_discoverer_extracts_structured_article_and_redacts_session(tmp_path):
-    biz = "MzExampleFlow=="
-    wechat_id = "gh_example_flow"
+    biz = "MzI4MzExMDU1Nw=="
+    wechat_id = "gh_4a7c644fa63b"
     url = (
-        "https://mp.weixin.qq.com/s?__biz=MzExampleFlow=="
+        "https://mp.weixin.qq.com/s?__biz=MzI4MzExMDU1Nw=="
         "&mid=2649902603&idx=1&sn=abc&chksm=def&scene=126&sessionid=secret#rd"
     )
     inner = {
@@ -32,7 +32,7 @@ def test_content_flow_cache_discoverer_extracts_structured_article_and_redacts_s
         "cdn_url": "https://mmbiz.qpic.cn/cover.jpg",
     }
     outer = {
-        "mp.weixin.qq.com/s?__biz=MzExampleFlow%3D%3D&mid=2649902603&idx=1": {
+        "mp.weixin.qq.com/s?__biz=MzI4MzExMDU1Nw%3D%3D&mid=2649902603&idx=1": {
             "Url": url,
             "Content": json.dumps(inner, ensure_ascii=False),
         }
@@ -84,15 +84,15 @@ def test_content_flow_cache_discoverer_ignores_other_accounts(tmp_path):
     blob = tmp_path / "blob"
     blob.write_bytes(dumps({"name": "__batch_get_appmsg_data", "data": json.dumps(outer, ensure_ascii=False)}))
 
-    articles = WechatContentFlowCacheDiscoverer(tmp_path, "MzExampleFlow==", "gh_example_flow").discover()
+    articles = WechatContentFlowCacheDiscoverer(tmp_path, "MzI4MzExMDU1Nw==", "gh_4a7c644fa63b").discover()
 
     assert articles == []
 
 
 def test_content_flow_cache_discoverer_converts_cached_html_to_clean_text(tmp_path):
-    biz = "MzExampleFlow=="
-    wechat_id = "gh_example_flow"
-    url = "https://mp.weixin.qq.com/s?__biz=MzExampleFlow==&mid=3&idx=1&sn=abc"
+    biz = "MzI4MzExMDU1Nw=="
+    wechat_id = "gh_4a7c644fa63b"
+    url = "https://mp.weixin.qq.com/s?__biz=MzI4MzExMDU1Nw==&mid=3&idx=1&sn=abc"
     inner = {
         "user_name": wechat_id,
         "nick_name": "刘晓光Savvy",

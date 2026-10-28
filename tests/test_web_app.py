@@ -129,7 +129,7 @@ def test_archive_job_reports_session_recovery_steps():
     assert snapshot["recovery_action"]
     assert "已先尝试保存的文章链接和 biz" in snapshot["recovery_action"]
     assert len(snapshot["recovery_steps"]) >= 3
-    assert any("自动搜索" in step for step in snapshot["recovery_steps"])
+    assert any("已保存的 seed 链接" in step for step in snapshot["recovery_steps"])
 
 
 def test_web_service_paginates_large_article_lists(tmp_path):

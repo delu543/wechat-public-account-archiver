@@ -48,6 +48,90 @@ def test_existing_accounts_are_adopted_as_baseline_idempotently(tmp_path):
     assert automation.unexported_articles(int(subscriptions[0]["account_id"])) == []
 
 
+def test_adopting_account_with_existing_word_membership_does_not_duplicate_article(tmp_path):
+    storage = Storage(tmp_path / "archive.sqlite")
+    automation = AutomationStore(storage)
+    automation.init_db()
+    article_id = save(
+        storage,
+        make_article("https://mp.weixin.qq.com/s/exported", "A", "biz-a", "exported", "body"),
+    )
+    account_id = storage.account_id_by_biz("biz-a")
+    automation.complete_export_batch(
+        account_id=account_id,
+        cycle_key="historical-full",
+        kind="initial_full",
+        article_ids=[article_id],
+        word_path="output/full/A.docx",
+    )
+
+    adopted = automation.adopt_existing_accounts(
+        now=datetime(2026, 8, 24, 14, tzinfo=timezone.utc)
+    )
+
+    assert len(adopted) == 1
+    subscription = automation.list_subscriptions()[0]
+    assert subscription["pending_export_count"] == 0
+    with storage.connect() as conn:
+        memberships = conn.execute(
+            "SELECT COUNT(*) FROM export_batch_articles WHERE article_id = ?", (article_id,)
+        ).fetchone()[0]
+    assert memberships == 1
+
+
+def test_activate_current_baseline_absorbs_pending_and_resets_weekly_schedule(tmp_path):
+    storage = Storage(tmp_path / "archive.sqlite")
+    automation = AutomationStore(storage)
+    automation.init_db()
+    save(storage, make_article("https://mp.weixin.qq.com/s/old", "A", "biz-a", "old", "old"))
+    automation.adopt_existing_accounts(now=datetime(2026, 8, 20, 12, tzinfo=timezone.utc))
+    subscription = automation.list_subscriptions()[0]
+    pending_id = save(
+        storage,
+        make_article("https://mp.weixin.qq.com/s/current", "A", "biz-a", "current", "current"),
+    )
+    job = automation.create_job(
+        int(subscription["id"]),
+        "legacy-cycle",
+        trigger="schedule",
+        scheduled_for=datetime(2026, 8, 23, 20, tzinfo=timezone.utc),
+    )
+    automation.update_job(job["id"], status="needs_session", phase="needs_session")
+    with storage.connect() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET enabled = 0, state = 'needs_session' WHERE id = ?",
+            (subscription["id"],),
+        )
+
+    activated = automation.activate_current_baseline(
+        schedule_weekday=6,
+        schedule_hour=21,
+        now=datetime(2026, 8, 24, 14, tzinfo=timezone.utc),
+    )
+
+    assert activated[0]["baseline_article_count"] == 1
+    assert activated[0]["next_run_at"] == "2026-08-30T21:00:00+00:00"
+    assert automation.unexported_articles(int(subscription["account_id"])) == []
+    refreshed = automation.list_subscriptions()[0]
+    assert refreshed["enabled"] == 1
+    assert refreshed["onboarding_mode"] == "incremental"
+    assert refreshed["schedule_hour"] == 21
+    assert refreshed["state"] == "active"
+    assert automation.job(job["id"])["status"] == "superseded"
+    with storage.connect() as conn:
+        membership = conn.execute(
+            "SELECT COUNT(*) FROM export_batch_articles WHERE article_id = ?", (pending_id,)
+        ).fetchone()[0]
+    assert membership == 1
+
+    repeated = automation.activate_current_baseline(
+        schedule_weekday=6,
+        schedule_hour=21,
+        now=datetime(2026, 8, 24, 14, 1, tzinfo=timezone.utc),
+    )
+    assert repeated[0]["baseline_article_count"] == 0
+
+
 def test_new_account_starts_full_then_exports_each_article_once(tmp_path):
     storage = Storage(tmp_path / "archive.sqlite")
     automation = AutomationStore(storage)
@@ -109,6 +193,32 @@ def test_jobs_are_persistent_and_deduplicated_by_account_cycle(tmp_path):
     assert restored["status"] == "discover"
     assert restored["discovered_count"] == 12
     assert restored["checkpoint_json"] == '{"offset": 20}'
+
+
+def test_global_pause_is_persistent_and_independent_of_subscription_flags(tmp_path):
+    storage = Storage(tmp_path / "archive.sqlite")
+    automation = AutomationStore(storage)
+    automation.init_db()
+    account_id = storage.upsert_account(
+        "A",
+        biz="biz-a",
+        source_url="https://mp.weixin.qq.com/s/a",
+    )
+    subscription = automation.ensure_subscription(
+        account_id,
+        "https://mp.weixin.qq.com/s/a",
+    )
+
+    assert automation.is_automation_paused() is False
+    paused = automation.set_automation_paused(True)
+
+    assert paused["paused"] is True
+    assert AutomationStore(Storage(storage.db_path)).is_automation_paused() is True
+    assert automation.list_subscriptions()[0]["enabled"] == subscription["enabled"] == 1
+
+    resumed = automation.set_automation_paused(False)
+    assert resumed["paused"] is False
+    assert automation.is_automation_paused() is False
 
 
 def test_same_content_hash_is_allowed_for_different_accounts(tmp_path):

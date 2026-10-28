@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -12,6 +13,8 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
+
+from .text_cleanup import clean_wechat_embedded_text, readable_text_from_content_html
 
 
 NOISE_LINES = {
@@ -31,7 +34,7 @@ NOISE_LINES = {
     "分享",
     "留言",
 }
-CJK_FONT = "Arial Unicode MS"
+CJK_FONT = "PingFang SC"
 
 
 class IncrementalWordExporter:
@@ -116,9 +119,15 @@ class IncrementalWordExporter:
         for result in results:
             cells = table.add_row().cells
             cells[0].text = str(result.get("account_name") or "")
-            cells[1].text = str(result.get("status") or "")
+            status = str(result.get("status") or "")
+            cells[1].text = {
+                "completed": "已完成",
+                "failed": "失败",
+                "needs_session": "等待微信会话",
+            }.get(status, status)
             cells[2].text = str(result.get("exported_count") or 0)
-            cells[3].text = str(result.get("word_path") or "无新增，不生成")
+            word_path = str(result.get("word_path") or "")
+            cells[3].text = Path(word_path).name if word_path else "无新增，不生成"
             for cell in cells:
                 cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
         self._set_table_geometry(table, (2700, 1500, 900, 4260))
@@ -209,7 +218,25 @@ class IncrementalWordExporter:
         run.font.color.rgb = RGBColor(96, 96, 96)
         if source_url:
             self._add_hyperlink(meta, source_url, source_url)
-        summary = self._clean_text(str(self._value(article, "summary") or ""))
+        title = str(self._value(article, "title") or "未命名文章")
+        summary = clean_wechat_embedded_text(
+            str(self._value(article, "summary") or "")
+        )
+        content_text = clean_wechat_embedded_text(
+            str(self._value(article, "content_text") or "")
+        )
+        content_html = str(self._value(article, "content_html") or "")
+        if content_html:
+            readable_text = readable_text_from_content_html(content_html)
+            if readable_text and self._same_text(readable_text, content_text):
+                content_text = readable_text
+        if self._is_title_only(content_text, title) and len(summary) >= max(
+            40, len(content_text) * 2
+        ):
+            content_text = summary
+            summary = ""
+        elif summary and self._same_text(summary, content_text):
+            summary = ""
         if summary:
             paragraph = document.add_paragraph()
             paragraph.paragraph_format.left_indent = Inches(0.12)
@@ -217,7 +244,7 @@ class IncrementalWordExporter:
             summary_run.italic = True
             summary_run.font.size = Pt(9.5)
             summary_run.font.color.rgb = RGBColor(96, 96, 96)
-        blocks = list(self._body_blocks(str(self._value(article, "content_text") or "")))
+        blocks = list(self._body_blocks(content_text))
         if not blocks:
             blocks = ["[正文为空，原始链接已保留]" ]
         for block in blocks:
@@ -312,8 +339,21 @@ class IncrementalWordExporter:
         return re.sub(r"[ \t]+", " ", value.replace("\u00a0", " ")).strip()
 
     @staticmethod
+    def _same_text(left: str, right: str) -> bool:
+        return re.sub(r"\s+", "", left) == re.sub(r"\s+", "", right)
+
+    @staticmethod
+    def _is_title_only(content_text: str, title: str) -> bool:
+        return bool(content_text.strip()) and IncrementalWordExporter._same_text(
+            content_text, title
+        )
+
+    @staticmethod
     def _article_year(article: Mapping[str, Any]) -> str:
         value = str(IncrementalWordExporter._value(article, "publish_time") or "")
+        parsed = IncrementalWordExporter._publication_datetime(value)
+        if parsed is not None:
+            return str(parsed.year)
         match = re.match(r"(\d{4})-", value)
         return match.group(1) if match else "未注明日期"
 
@@ -328,11 +368,18 @@ class IncrementalWordExporter:
     @staticmethod
     def _publish_label(value: Any) -> str:
         raw = str(value or "")
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
+        parsed = IncrementalWordExporter._publication_datetime(raw)
+        if parsed is None:
             return raw or "未注明日期"
         return f"{parsed.year}年{parsed.month}月{parsed.day}日 {parsed:%H:%M}"
+
+    @staticmethod
+    def _publication_datetime(value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed.astimezone(ZoneInfo("Asia/Shanghai")) if parsed.tzinfo else parsed
 
     @staticmethod
     def _article_period_label(
@@ -342,9 +389,13 @@ class IncrementalWordExporter:
         dates: list[str] = []
         for article in articles:
             value = str(IncrementalWordExporter._value(article, "publish_time") or "")
-            match = re.match(r"(\d{4}-\d{2}-\d{2})", value)
-            if match:
-                dates.append(match.group(1))
+            parsed = IncrementalWordExporter._publication_datetime(value)
+            if parsed is not None:
+                dates.append(parsed.date().isoformat())
+            else:
+                match = re.match(r"(\d{4}-\d{2}-\d{2})", value)
+                if match:
+                    dates.append(match.group(1))
         if not dates:
             return fallback
         start = min(dates)

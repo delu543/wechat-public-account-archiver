@@ -44,3 +44,12 @@ def test_fetcher_marks_captcha_redirect_url_as_restricted():
     )
 
     assert status == "restricted:captcha"
+
+
+def test_fetcher_marks_generic_unviewable_article_as_unavailable():
+    status = ArticleFetcher()._status_from_response(
+        200,
+        '<script>config: {"title":"文章内容无法查看"}</script>',
+    )
+
+    assert status == "restricted:unavailable"

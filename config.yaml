@@ -9,12 +9,14 @@ web:
   port: 8765
 
 automation:
-  enabled: true
+  # Source availability and installed UI integration need separate acceptance.
+  # Installing source must not silently revive old foreground recovery.
+  enabled: false
   weekday: 6
-  hour: 20
+  hour: 21
   minute: 0
   check_interval_seconds: 60
-  prepare_wechat_session: true
+  prepare_wechat_session: false
   session_ready_timeout_seconds: 15
   session_retry_hours: 12
 
@@ -37,3 +39,19 @@ discoverers:
     enabled: false
   official_api:
     enabled: false
+
+# Set the frozen already-delivered boundary from actual local evidence, never
+# from the maximum id after a new crawl. Zero is safe for a fresh empty archive.
+passive_weekly:
+  delivered_baseline_max_article_id: 0
+  freshness_hours: 36
+  incomplete_article_ids: []
+  recovery_gaps: {}
+  # For an account with no archived article, set the user's requested date:
+  # initial_since: "YYYY-MM-DD"
+
+# Private migration references belong only in the local product config.
+cache_update:
+  excluded_biz: []
+  prior_stage_roots: []
+  delivery_receipts: []

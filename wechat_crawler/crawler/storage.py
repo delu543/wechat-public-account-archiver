@@ -117,6 +117,8 @@ class Storage:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_identity
                     ON articles(account_id, title, publish_time)
                     WHERE title != '' AND publish_time IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_articles_account_publish
+                    ON articles(account_id, publish_time, id);
                 """
             )
             self._ensure_column(conn, "article_urls", "publish_date_hint TEXT")

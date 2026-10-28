@@ -32,7 +32,7 @@ def test_parse_history_response_extracts_all_article_items_and_next_offset():
                             "author": "作者",
                             "digest": "摘要",
                             "content_url": (
-                                "https://mp.weixin.qq.com/s?__biz=MzExampleAccount=="
+                                "https://mp.weixin.qq.com/s?__biz=MzA3OTQzNjk1MA=="
                                 "&mid=2647929883&idx=1&sn=abc&chksm=def&scene=124"
                             ),
                             "cover": "https://mmbiz.qpic.cn/cover.jpg",
@@ -40,7 +40,7 @@ def test_parse_history_response_extracts_all_article_items_and_next_offset():
                                 {
                                     "title": "次条",
                                     "content_url": (
-                                        "https://mp.weixin.qq.com/s?__biz=MzExampleAccount=="
+                                        "https://mp.weixin.qq.com/s?__biz=MzA3OTQzNjk1MA=="
                                         "&mid=2647929883&idx=2&sn=ghi&chksm=jkl&key=secret"
                                     ),
                                 }
@@ -59,7 +59,7 @@ def test_parse_history_response_extracts_all_article_items_and_next_offset():
     assert page.next_offset == 10
     assert [item.title for item in page.items] == ["主文章", "次条"]
     assert page.items[0].public_url == (
-        "https://mp.weixin.qq.com/s?__biz=MzExampleAccount%3D%3D"
+        "https://mp.weixin.qq.com/s?__biz=MzA3OTQzNjk1MA%3D%3D"
         "&mid=2647929883&idx=1&sn=abc&chksm=def"
     )
     assert "key=secret" not in page.items[1].public_url
@@ -70,8 +70,9 @@ def test_session_recovery_errors_are_classified_without_sensitive_values():
     assert is_session_recovery_error("missing appmsg_token in signed article page")
     assert is_session_recovery_error("profile history returned ret=-3 errmsg=invalid session")
     assert is_session_recovery_error("profile history returned ret=-6 errmsg=unknown error")
-    assert is_session_recovery_error("signed article URL requires verification")
+    assert not is_session_recovery_error("signed article URL requires verification")
     assert is_session_recovery_error("signed article URL is missing required session fields")
+    assert is_session_recovery_error("signed article URL fetch failed")
     assert not is_session_recovery_error("profile history response is not JSON")
 
     guidance = session_recovery_guidance("测试号")
@@ -123,6 +124,7 @@ def test_load_session_keeps_stronger_missing_token_error(monkeypatch, tmp_path):
     )
 
     class Response:
+        status_code = 200
         url = "https://mp.weixin.qq.com/s"
         text = "<html><body>public article without a history token</body></html>"
 

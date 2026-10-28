@@ -1,100 +1,77 @@
 ---
 name: wechat-public-account-history
-description: Use when archiving WeChat Official Account articles from one public article URL, especially when history discovery is slow, incomplete, missing appmsg_token, ret=-3, ret=-6, captcha, unavailable, or local website jobs need session recovery.
+description: Discover and archive a public WeChat account's articles and short content from an article seed, including history pagination, incomplete cache recovery and exact-biz Word export. Adapt source selection to current client capabilities. Not for private chat export.
 ---
 
 # WeChat Public Account History
 
-Use this skill in this repository when one public article URL should expand into that account's public history archive.
+Expand a public article seed into the requested account interval using the active product workspace identified by project guidance, not an assumed personal path. Prefer mature project readers and exporters over ad hoc replacements. This is a version-adaptive workflow, not a mandatory old-client click sequence.
 
-## Boundaries
+## Inputs and existing progress
 
-- Use the original article URL, exact `biz`, and the user's visible Mac WeChat public session.
-- Do not use third-party search as a substitute, solve CAPTCHA, bypass login/paywalls, decrypt private stores, or persist/report raw `key`, `pass_ticket`, `uin`, `exportkey`, session ids, or token-like values.
-- Keep accounts separated by exact `biz`; account name is not enough.
-- Never search or read the user's historical chats. Visible recovery must start from a fresh main-window global search field and public-account pages.
+- Reuse the user's seed links, saved exact `biz`, WeChat ID, archive/export progress and unresolved gaps. An old public seed identifies the account; it need not be the newest article.
+- Preserve an already established inclusive start/end interval. For a new request with no determinable range, ask whether it means all history or a start date.
+- Full-history discovery and incremental discovery use the same source; full history runs to verified end-of-list, increments to the saved boundary.
+- Inspect project guidance, capability docs and current task state. Historical failure notes are evidence, not universal prohibitions. Methods can be repaired under the current user authorization.
+- Preserve old databases, outputs and user changes. Authorized network access, new staging and local export are normal task steps; they are not prohibited by an earlier read-only diagnostic.
+- Do not start paused automation, initialize keys, access private stores or send private data to a third party under this skill alone.
 
-## Mandatory Order
+## Source decision
 
-1. Before every new account crawl, establish the time range in the Codex conversation. If the user did not already provide it, ask: `抓取全部历史，还是从某个日期开始？` Wait for the answer. For a bounded crawl, require a valid `YYYY-MM-DD` start date; never guess one. An explicit `全部/全量/所有历史` answer means no date flag.
-2. Parse the seed article and identify `account_name`, `wechat_id`, and `biz`.
-3. Always probe URL history discovery with the saved seed URL and exact `biz` before opening or searching WeChat. An old public article URL is sufficient as the durable seed; the account homepage is not a required input. For a bounded crawl, pass the same `--since YYYY-MM-DD` to discovery, every crawl/retry pass, and any resumed command.
-4. If the probe reports `missing appmsg_token`, `ret=-3`, `ret=-6`, `requires verification`, `invalid appmsg_token`, or `no signed article URL found`, treat it as a visible WeChat session problem. Close only stale product-owned public-search/profile windows, click the fresh global search field in the WeChat main window, submit the saved public seed URL, and open the top `访问网页` result. Use exact account-name `搜一搜` only when no valid seed URL exists. Do not use `Command-F`, because current WeChat versions route it to chat-history search. Confirm success only after the requested exact account's opaque signed-session fingerprint changes, then rerun the same URL/history command with the same date range. Ask the user only for native CAPTCHA or login confirmation that cannot be automated. Do not disable the user's VPN.
-5. Use URL history pagination as the primary path. It is the fast path: one valid session can discover hundreds or thousands of URL records. Every weekly/manual automation cycle begins at offset `0` and scans newest-first back to the stored inclusive cutoff; a CLI resume offset must never leak into incremental automation. A start date only stops pagination after the date boundary; it does not change the discovery method.
-6. Use `history-cache-sync` only as a fallback after the article-detail session path has been retried and still cannot paginate. Cache import only sees complete article bodies already written by WeChat; visible list cards alone are not proof that full bodies are cached.
-7. Crawl in stages: fast first pass, low-concurrency failed retry, then one conservative retry for `unavailable` if needed. Stop and log `captcha`, login, rate-limit, paywall, and still-unavailable records. Keep the selected date range identical across all passes.
-8. Export only the target account by exact `biz`.
+First determine which source actually works in this environment. Do not require a `profile_ext` probe or WeChat UI operation before using already available public data.
 
-## Mac WeChat Window Recovery
+- A working public history listing or authorized official export can support completeness if pagination, exact identity, content types and interval boundaries are verifiable.
+- A separately authorized, already bound push helper can provide unattended discovery. It may omit articles that were published but not broadcast; label that boundary.
+- Native public caches are a viable passive source. Use the shared bounded reader and persistent per-account accumulator, merging across cache windows rather than scanning only the final page.
+- Public search and alternate catalogs can supplement discovery, not prove completeness merely by returning results. Validate every candidate against exact `biz`; a directory with long articles only cannot satisfy an all-content request.
+- Use legacy session pagination or visible recovery only after confirming it is still supported and permitted. Do not acquire/replay client keys, inject into WeChat, or repeatedly cause logout to preserve an obsolete method.
 
-- Target WeChat by bundle identifier `com.tencent.xinWeChat`, never by the localized process name alone. WeChat 4.x may expose an outer shell process while the real content renderer runs as `com.tencent.flue.WeChatAppEx`.
-- Before any UI action, verify that the Mac session is unlocked, the outer process is running, and the renderer process exists. If the screen is locked or WeChat only exposes the compact login shell, defer the task without clicking the login window.
-- A blank or white capture is not proof that WeChat is logged out. First inspect the renderer process and visible WindowServer title/bounds metadata. Use those signals plus exact-`biz` history/API results; do not weaken macOS privacy controls or attempt to capture protected pixels.
-- Activate the main WeChat window through the bundle identifier. Prefer the saved public seed URL, open its `访问网页` result, and validate success by observing the requested account's exact `biz` in newly available article/history data. Search the exact account name only as a no-seed fallback. A click attempt without this validation is not success.
-- Use the main-window global search field and a newly opened public-search window for every recovery attempt. Do not reuse or inspect a chat-history search window.
-- Prefer native foreground keyboard/mouse events against freshly read window bounds because WeChat 4.x renderer cards may not expose ordinary AX controls. Never reuse an arbitrary stale `微信 (窗口)` or `公众号` window without validating the target account.
-- Scan a bounded newest-first set of Chromium `Cache/Cache_Data` files in addition to `Share Data`, IndexedDB, and other existing stores. This is read-only; do not copy the cache or persist signed parameters.
-- Discover the currently active `multitab_*` profile from the public open-file metadata of `WeChatAppEx`; do not enumerate the protected historical `profiles` parent. Put short killable timeouts around protected directory/file reads so an unavailable cache returns `needs_session` instead of hanging.
-- Preserve and restore the clipboard after temporary search text. Never persist or print session tokens.
-- Compare only an opaque in-memory hash of exact-account signed URLs before and after the visible article open. Never return or log the signed URLs themselves.
+Network requests and durable storage are allowed when in the user's task scope. A real CAPTCHA/login/paywall/401/403/429 restriction stops the affected source and shared requests; do not solve it automatically or change routes/identities to evade it. A normal user verification and explicit resumption are different from unrestricted automatic retries.
 
-## Completion Accounting
+## Passive cache recovery
 
-- Report discovery and export with an explicit equation: `discovered = already archived overlap + newly crawled + failed + restricted`.
-- `exported` must equal the newly eligible, successfully parsed articles not already present in a completed export batch. Previously archived overlap is not a failed export.
-- Require zero duplicate normalized URLs, zero duplicate non-empty content hashes within an account, and zero article membership in multiple Word batches before declaring completion.
-- Generate Word through a preparing/completed batch record so an interrupted run can resume without exporting the same article twice.
+1. Locate the active public homepage cache using the existing whitelisted reader; avoid unrelated chats and private stores.
+2. Snapshot bounded files, decode known Chromium/LevelDB formats and inspect actual health errors before attributing misses to the user.
+3. Validate exact `biz`, WeChat ID and permanent link identity in the inner record even when an outer index omits a field.
+4. Retain sanitized public records in an owned stage before the live cache replaces them; keep earlier windows and deduplicate across them.
+5. Preserve both article and short-content body fields. Label a derived first-line title. A short text is not necessarily a preview; explicit truncation/restriction and known incomplete baselines remain unresolved.
+6. Compare newest/oldest boundaries, page ordering, read errors, conflicting versions and a genuine independent publication index when available.
+7. Do not make the user repeat an already completed nine-account refresh because a decoder failed. First repair/retest the reader and consume retained data. For a remaining specific gap, request the smallest input and start collection before the user's action.
 
-## Date Range Contract
+Cache contents being readable or spanning both dates does not establish that every intervening publication was retained. Do not manufacture a complete index from the same incomplete set of bodies.
 
-- No date means the existing full-history behavior. Do not add a date implicitly.
-- `--since YYYY-MM-DD` means include articles published on that date or later.
-- Automatic weekly/manual increments always start discovery at the newest page, then stop after reaching the stored inclusive cutoff.
-- Date selection changes only which history records and bodies are processed. It must not change URL normalization, exact-`biz` account separation, session recovery, request pacing, retry classes, deduplication, storage, or export ordering.
-- Previously archived older articles remain in SQLite and existing account exports. A bounded crawl does not delete older archive data.
-- The local website exposes the same optional start-date field and sends it with the archive job.
+## Conditional visible entry
 
-## Commands
+Only when currently authorized and safe:
 
-Fast URL-history path:
+- Verify a normal unlocked window and actual input focus. Use a saved public URL in a fresh public search field and open its visible result; do not search chat history or send the link to a conversation.
+- Do not require protected screenshots, weaken privacy controls or use blind coordinates. A protected/unusable window stops this step, not independent authorized parsing.
+- Preserve the clipboard where relevant. A launch command or visible page is not proof of fresh account data; verify the resulting exact-account list/cache.
+- After login/verification/forced logout, stop repeated automation and reassess the source. The old search/click path is not mandatory.
 
-```bash
-.venv/bin/python main.py discover-account --url "https://mp.weixin.qq.com/s/..." --delay 0.1 --max-items 1300
-.venv/bin/python main.py crawl --account-biz "BIZ" --fast --workers 6 --min-delay 0 --max-delay 0 --max-retries 0
-.venv/bin/python main.py crawl --account-biz "BIZ" --retry-failed --workers 3 --min-delay 0.2 --max-delay 0.5 --max-retries 1
-.venv/bin/python main.py export --account-biz "BIZ" --force
-```
+## Retention, bodies and export
 
-Start-date variant (use the same date in every pass):
+- Keep Beijing publication dates and the same interval in every pass. Save permanent public URLs and source evidence, never raw session parameters.
+- Fetch missing publicly accessible bodies conservatively. Preserve empty/unavailable/mismatch/verification reasons. Do not follow a repost's original across account boundaries to fill the wrong archive.
+- De-duplicate URL identity, non-empty body hash and export membership; preserve per-account isolation and resumable batch state.
+- Complete export requires genuine interval coverage and eligible bodies. Prefer machine verification when the source provides sufficient evidence; do not require the user to attest every machine-verified catalog. Human assertions must remain explicit and must never be invented.
+- If only discovered content is known, keep that status and any gaps. Export it only when the user accepts partial/discovered output. Do not advance a full-history success node on unknown coverage.
+- Export each qualified account without holding it behind an unrelated account. Create no empty Word; verify counts and readability, record membership, and report exact paths and the covered interval.
+- Account for discovered = previously exported overlap + newly eligible + unresolved/restricted. Parsing tests, source success, complete coverage and Word delivery are separate claims.
 
-```bash
-.venv/bin/python main.py discover-account --url "https://mp.weixin.qq.com/s/..." --since 2026-01-01 --delay 0.1 --max-items 1300
-.venv/bin/python main.py crawl --account-biz "BIZ" --since 2026-01-01 --fast --workers 6 --min-delay 0 --max-delay 0 --max-retries 0
-.venv/bin/python main.py crawl --account-biz "BIZ" --since 2026-01-01 --retry-failed --workers 3 --min-delay 0.2 --max-delay 0.5 --max-retries 1
-```
+## Project entry points
 
-Known account path:
+Inspect current `--help` and module interfaces before execution; commands are not guarantees of source availability:
 
-```bash
-.venv/bin/python main.py history-sync --biz "BIZ" --wechat-id "gh_xxx" --account-name "NAME" --delay 0.08 --max-items 1300
-```
+- `main.py cache-update --check`: preferred repeatable retained-cache workflow; read `docs/CACHE_UPDATE.md`. No client read or product writes. Verified local Word receipts are independent from full-coverage progress and must suppress repeats even when the product node is unchanged.
+- `main.py cache-update --collect --seconds 600`: bounded shared collection; start before genuinely necessary human browsing. Only an authorized one-off may add `--allow-local-stage-while-paused`; never change the persistent pause. Saved exclusions and known gaps remain in force.
+- `main.py cache-update --export --accept-discovered`: explicitly accepted, dated per-account output; no empty Word and no completeness claim. Resume pending batches, actually render/review, then register with `--confirm-delivery '<batch folder>' --render-reviewed`. Registration is an operator attestation, not an automatic renderer. No user click is needed for routine artifact QA.
+- `main.py weekly-run --check`: health/coverage check when supported by the current source configuration.
+- `wechat_crawler.cache_capture_all`: shared public-cache discovery/collection for registered accounts.
+- `wechat_crawler.cache_capture_review`: read-only reconciliation of retained stages against the product baseline.
+- `wechat_crawler.cache_capture_word`: complete-coverage Word path; follow its actual evidence contract.
+- `main.py discover-account`, `history-sync`, `history-cache-sync`: legacy/conditional paths, not compulsory fallback chains.
 
-Cache fallback:
+Keep source-specific implementation details and validation evidence in project docs, not permanent assumptions about one WeChat version in this skill.
 
-```bash
-.venv/bin/python main.py history-cache-sync --biz "BIZ" --wechat-id "gh_xxx" --account-name "NAME" --max-cache-file-mb 220 --export
-```
-
-## Failure Meanings
-
-- `missing appmsg_token`, `ret=-3`, `ret=-6`: open a public article detail page in Mac WeChat and rerun URL history.
-- `提示/当前页面无法访问` only after external launch: verify public article HTTP reachability and proxy routing without changing network settings. If reachable, keep the VPN running and reopen the article from WeChat search or an in-WeChat link.
-- visible history list but no cache records: list cards are rendered but full bodies were not written to `__batch_get_appmsg_data`.
-- many timeouts: finish the fast pass, then retry failed URLs with lower concurrency.
-- `captcha`: stop that source until the user handles normal WeChat verification; do not bypass.
-- `unavailable`: retry once conservatively, then keep the failure reason.
-- `missing article title` with a tiny shell page: record as parse failure; do not fabricate content.
-
-## Local Website Contract
-
-The website should call the same fixed workflow: accept an optional start date, parse and retain the seed URL, start exact-`biz` URL history at the newest page with that boundary, automatically attempt saved-link-first visible-WeChat recovery only after `needs_session`, require an exact-account session-fingerprint change before claiming recovery, pause only if the final history retry fails, crawl all staged passes with the same boundary, show ETA and final unresolved counts, and export only the target `biz` folder.
+The cache path still cannot invent uncached historical pages. For all-history requests, first seek a genuinely paginated complete source; explain the unverified boundary if none works, instead of promising that one seed or one opened article yields everything. Do not restart a failed key initialization or a catalog known to omit short content merely to claim automation.

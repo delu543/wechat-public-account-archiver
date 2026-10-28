@@ -5,12 +5,14 @@ import html as html_module
 import re
 from datetime import datetime
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 
 from .dedup import normalized_text_hash
 from .models import ParsedArticle
 from .normalizer import extract_mp_params, normalize_url
+from ..text_cleanup import clean_wechat_embedded_text, readable_text_from_content_html
 
 
 class ParseError(RuntimeError):
@@ -49,21 +51,49 @@ class WechatArticleParser:
         if not account_name:
             account_name = "unknown-account"
 
+        summary = self._meta_content(
+            soup,
+            [
+                ("name", "description"),
+                ("property", "og:description"),
+            ],
+        )
+        if summary:
+            summary = clean_wechat_embedded_text(summary)
+
         content = soup.select_one("#js_content") or soup.select_one("article")
-        script_content_mode = content is None and bool(script_body_text)
+        embedded_content_html = None
+        if content is None or not content.get_text("", strip=True):
+            embedded_content_html = self._script_article_content_html(html)
+        script_content_mode = bool(embedded_content_html) or (
+            content is None and bool(script_body_text)
+        )
         if content is None and not script_content_mode:
             content = soup.body
         if content is None and not script_content_mode:
             raise ParseError("missing article body")
 
         if script_content_mode:
-            content_text = script_body_text or ""
-            content_html = self._text_to_html(content_text)
+            if embedded_content_html:
+                embedded_content = BeautifulSoup(embedded_content_html, "html.parser")
+                self._clean_content(embedded_content, source_url)
+                content_html = str(embedded_content).strip()
+                content_text = readable_text_from_content_html(content_html)
+                image_urls = self._extract_images(embedded_content, source_url)
+            else:
+                content_text = clean_wechat_embedded_text(script_body_text or "")
+                if self._is_title_only(content_text, title) and self._is_substantial_summary(
+                    summary, content_text
+                ):
+                    content_text = summary or content_text
+                content_html = self._text_to_html(content_text)
+                image_urls = []
         else:
             content = BeautifulSoup(str(content), "html.parser")
             self._clean_content(content, source_url)
-            content_text = content.get_text("\n", strip=True)
             content_html = str(content).strip()
+            content_text = readable_text_from_content_html(content_html)
+            image_urls = self._extract_images(content, source_url)
         if not content_text:
             raise ParseError("empty article body")
 
@@ -89,14 +119,6 @@ class WechatArticleParser:
         if not publish_time:
             publish_time = self._publish_time_from_script(html)
 
-        image_urls = [] if script_content_mode else self._extract_images(content, source_url)
-        summary = self._meta_content(
-            soup,
-            [
-                ("name", "description"),
-                ("property", "og:description"),
-            ],
-        )
         cover_image = self._meta_content(soup, [("property", "og:image")])
         if not cover_image:
             cover_image = self._regex_first(
@@ -196,7 +218,9 @@ class WechatArticleParser:
             ],
         )
         if ct:
-            return datetime.fromtimestamp(int(ct)).astimezone().isoformat(timespec="seconds")
+            return datetime.fromtimestamp(
+                int(ct), ZoneInfo("Asia/Shanghai")
+            ).isoformat(timespec="seconds")
         return None
 
     def _script_article_text(self, html: str) -> str | None:
@@ -211,6 +235,13 @@ class WechatArticleParser:
         if not value:
             return None
         cleaned = re.sub(r"\r\n?", "\n", value).strip()
+        return cleaned or None
+
+    def _script_article_content_html(self, html: str) -> str | None:
+        value = self._first_js_string(html, [r"content_noencode\s*:"])
+        if not value:
+            return None
+        cleaned = value.strip()
         return cleaned or None
 
     def _first_js_string(self, html: str, prefixes: list[str]) -> str | None:
@@ -242,6 +273,18 @@ class WechatArticleParser:
         if not first_line:
             return ""
         return first_line if len(first_line) <= 90 else first_line[:87].rstrip() + "..."
+
+    @staticmethod
+    def _is_title_only(content_text: str, title: str) -> bool:
+        compact_body = re.sub(r"\s+", "", content_text)
+        compact_title = re.sub(r"\s+", "", title)
+        return bool(compact_body) and compact_body == compact_title
+
+    @staticmethod
+    def _is_substantial_summary(summary: str | None, content_text: str) -> bool:
+        if not summary:
+            return False
+        return len(summary.strip()) >= max(40, len(content_text.strip()) * 2)
 
     def _text_to_html(self, text: str) -> str:
         paragraphs = [part.strip() for part in re.split(r"\n{2,}", text) if part.strip()]

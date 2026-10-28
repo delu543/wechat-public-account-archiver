@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import plistlib
@@ -160,6 +161,8 @@ class LaunchAgentManager:
                 "Foundation",
                 "-framework",
                 "ApplicationServices",
+                "-framework",
+                "UserNotifications",
                 str(source),
                 "-o",
                 str(executable),
@@ -179,13 +182,34 @@ class LaunchAgentManager:
             "CFBundleName": STATUS_APP_NAME,
             "CFBundlePackageType": "APPL",
             "CFBundleShortVersionString": "1.0",
-            "CFBundleVersion": "1",
+            "CFBundleVersion": "2",
             "LSMinimumSystemVersion": "13.0",
             "LSUIElement": True,
             "NSHighResolutionCapable": True,
+            "WeChatArchiveSourceSHA256": self._status_source_hash(),
         }
         with (temporary / "Contents" / "Info.plist").open("wb") as handle:
             plistlib.dump(info, handle, sort_keys=True)
+        signature = subprocess.run(
+            [
+                "/usr/bin/codesign",
+                "--force",
+                "--deep",
+                "--sign",
+                "-",
+                "--identifier",
+                STATUS_LABEL,
+                str(temporary),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if signature.returncode != 0:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise RuntimeError(
+                (signature.stderr or signature.stdout or "status app signing failed").strip()
+            )
         if self.status_app_path.exists():
             shutil.rmtree(self.status_app_path)
         temporary.replace(self.status_app_path)
@@ -200,7 +224,24 @@ class LaunchAgentManager:
                 info = plistlib.load(handle)
         except (OSError, plistlib.InvalidFileException):
             return False
-        return info.get("CFBundleIdentifier") == STATUS_LABEL
+        if not (
+            info.get("CFBundleIdentifier") == STATUS_LABEL
+            and info.get("WeChatArchiveSourceSHA256") == self._status_source_hash()
+        ):
+            return False
+        signature = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(self.status_app_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return signature.returncode == 0
+
+    def _status_source_hash(self) -> str:
+        source = self.project_root / "wechat_crawler" / "macos_status" / "StatusApp.swift"
+        if not source.is_file():
+            return ""
+        return hashlib.sha256(source.read_bytes()).hexdigest()
 
     def _status_agent_payload(self) -> dict[str, Any]:
         return {

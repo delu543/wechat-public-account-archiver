@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import UserNotifications
 
 private func statusLog(_ message: String) {
     guard let data = "[status-item] \(message)\n".data(using: .utf8) else { return }
@@ -17,6 +18,7 @@ private struct Overview: Decodable {
     let pendingExportCount: Int
     let nextRunAt: String?
     let schedulerRunning: Bool
+    let automationPaused: Bool
     let wechatSessionCache: SessionCache?
 }
 
@@ -34,6 +36,15 @@ private struct LatestWord: Decodable {
     let wordPath: String?
 }
 
+private struct CompletionEvent: Decodable {
+    let cycleKey: String
+    let scheduledFor: String
+    let completedAt: String?
+    let outputFolder: String
+    let accountCount: Int
+    let exportedCount: Int
+}
+
 private struct SessionRequest: Decodable {
     let subscriptionId: Int
     let accountName: String
@@ -47,6 +58,7 @@ private struct WidgetPayload: Decodable {
     let attentionMessage: String
     let currentJob: CurrentJob?
     let latestWord: LatestWord?
+    let latestCompletion: CompletionEvent?
     let outputDir: String
     let sessionRequests: [SessionRequest]
 }
@@ -60,13 +72,16 @@ private final class StatusViewController: NSViewController {
     private let detailLabel = NSTextField(wrappingLabelWithString: "等待自动计划")
     private let progress = NSProgressIndicator()
     private let progressValue = NSTextField(labelWithString: "0%")
+    private let pauseAllButton = NSButton(title: "暂停全部爬取", target: nil, action: nil)
     private let latestWordButton = NSButton(title: "暂无新增 Word", target: nil, action: nil)
     private var outputDir = ""
     private var latestWordPath: String?
+    private var automationPaused = false
     var refreshAction: (() -> Void)?
+    var pauseAction: ((Bool) -> Void)?
 
     override func loadView() {
-        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 330))
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 360, height: 378))
 
         let title = NSTextField(labelWithString: "微信公众号归档")
         title.font = .systemFont(ofSize: 17, weight: .semibold)
@@ -97,6 +112,13 @@ private final class StatusViewController: NSViewController {
         progress.controlSize = .small
         progressValue.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
         progressValue.textColor = .secondaryLabelColor
+
+        pauseAllButton.bezelStyle = .rounded
+        pauseAllButton.image = NSImage(systemSymbolName: "pause.circle", accessibilityDescription: "暂停全部爬取")
+        pauseAllButton.imagePosition = .imageLeading
+        pauseAllButton.target = self
+        pauseAllButton.action = #selector(togglePauseAll)
+        pauseAllButton.widthAnchor.constraint(equalToConstant: 324).isActive = true
 
         let progressRow = NSStackView(views: [progress, progressValue])
         progressRow.orientation = .horizontal
@@ -137,6 +159,7 @@ private final class StatusViewController: NSViewController {
             detailLabel,
             progressRow,
             separator(),
+            pauseAllButton,
             latestWordButton,
             actions,
         ])
@@ -158,8 +181,18 @@ private final class StatusViewController: NSViewController {
         subscriptionsValue.stringValue = "\(payload.overview.enabledCount)/\(payload.overview.subscriptionCount)"
         pendingValue.stringValue = "\(payload.overview.pendingExportCount) 篇"
         nextRunValue.stringValue = compactDate(payload.overview.nextRunAt)
+        automationPaused = payload.overview.automationPaused
+        pauseAllButton.title = automationPaused ? "继续全部爬取" : "暂停全部爬取"
+        pauseAllButton.image = NSImage(
+            systemSymbolName: automationPaused ? "play.circle.fill" : "pause.circle",
+            accessibilityDescription: pauseAllButton.title
+        )
+        pauseAllButton.isEnabled = true
 
-        if payload.attentionCount > 0 {
+        if automationPaused {
+            stateLabel.stringValue = "全部爬取已暂停"
+            stateLabel.textColor = .systemOrange
+        } else if payload.attentionCount > 0 {
             stateLabel.stringValue = "有 \(payload.attentionCount) 个账号需要处理"
             stateLabel.textColor = .systemOrange
         } else if payload.overview.schedulerRunning {
@@ -177,7 +210,13 @@ private final class StatusViewController: NSViewController {
             progressValue.stringValue = "\(job.progress)%"
         } else {
             jobLabel.stringValue = "暂无运行任务"
-            detailLabel.stringValue = payload.attentionMessage.isEmpty ? "等待下一次自动计划" : payload.attentionMessage
+            if !payload.attentionMessage.isEmpty {
+                detailLabel.stringValue = payload.attentionMessage
+            } else if let completion = payload.latestCompletion {
+                detailLabel.stringValue = "上轮已经弄好了 · \(completion.accountCount) 个公众号 · 新增 \(completion.exportedCount) 篇"
+            } else {
+                detailLabel.stringValue = "等待下一次自动计划"
+            }
             progress.doubleValue = 0
             progressValue.stringValue = "0%"
         }
@@ -197,6 +236,13 @@ private final class StatusViewController: NSViewController {
         stateLabel.textColor = .systemRed
         jobLabel.stringValue = "等待服务恢复"
         detailLabel.stringValue = "自动启动会继续尝试"
+        pauseAllButton.isEnabled = false
+    }
+
+    func setPauseUpdateFailed() {
+        stateLabel.stringValue = "暂停状态更新失败"
+        stateLabel.textColor = .systemRed
+        pauseAllButton.isEnabled = true
     }
 
     @objc private func openDashboard() {
@@ -215,6 +261,11 @@ private final class StatusViewController: NSViewController {
 
     @objc private func refreshNow() {
         refreshAction?()
+    }
+
+    @objc private func togglePauseAll() {
+        pauseAllButton.isEnabled = false
+        pauseAction?(!automationPaused)
     }
 
     private func metric(title: String, value: NSTextField) -> NSView {
@@ -262,37 +313,54 @@ private final class StatusViewController: NSViewController {
     }
 }
 
-private final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+private final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let popover = NSPopover()
     private let controller = StatusViewController()
     private var timer: Timer?
+    private var currentStatusBadge = ""
     private var sessionPreparationInFlight = false
+    private var foregroundSessionProcess: Process?
+    private var automationPaused = false
     private var serviceOnline: Bool?
     private var lastSessionRequestCount: Int?
     private var lastScreenLocked: Bool?
+    private let notificationCenter = UNUserNotificationCenter.current()
+    private let maxSessionPreparationAttempts = 3
+    private let sessionPreparationCooldown: TimeInterval = 60
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusLog("status item launched")
         NSApp.setActivationPolicy(.accessory)
-        if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "tray.full.fill", accessibilityDescription: "公众号归档")
-            button.imagePosition = .imageLeading
-            button.title = " 归档"
-            button.target = self
-            button.action = #selector(togglePopover)
-            button.toolTip = "微信公众号自动归档"
+        notificationCenter.delegate = self
+        notificationCenter.requestAuthorization(options: [.alert, .sound]) { granted, error in
+            if let error {
+                statusLog("notification authorization failed: \(error.localizedDescription)")
+            } else {
+                statusLog("notification authorization: \(granted ? "granted" : "not granted")")
+            }
         }
+        configureStatusButton()
+        statusLog("status item visible: \(statusItem.isVisible)")
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
         popover.contentViewController = controller
-        popover.contentSize = NSSize(width: 360, height: 330)
+        popover.contentSize = NSSize(width: 360, height: 378)
         popover.behavior = .transient
         controller.refreshAction = { [weak self] in self?.refresh() }
+        controller.pauseAction = { [weak self] paused in self?.setAutomationPaused(paused) }
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
+            self?.ensureStatusItemVisible()
             self?.refresh()
         }
-        if !UserDefaults.standard.bool(forKey: "didShowInitialPopover") {
-            UserDefaults.standard.set(true, forKey: "didShowInitialPopover")
+        let visibilityOnboardingKey = "didShowVisibilityPopover-v2"
+        if !UserDefaults.standard.bool(forKey: visibilityOnboardingKey) {
+            UserDefaults.standard.set(true, forKey: visibilityOnboardingKey)
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.showPopover() }
         }
     }
@@ -301,6 +369,44 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePopover() {
         popover.isShown ? popover.performClose(nil) : showPopover()
+    }
+
+    @objc private func workspaceDidWake() {
+        ensureStatusItemVisible()
+        refresh()
+    }
+
+    private func configureStatusButton() {
+        statusItem.isVisible = true
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(
+            systemSymbolName: "tray.full.fill",
+            accessibilityDescription: "公众号归档"
+        )
+        button.image?.isTemplate = true
+        button.target = self
+        button.action = #selector(togglePopover)
+        button.toolTip = "微信公众号自动归档"
+        setStatusBadge(currentStatusBadge)
+    }
+
+    private func ensureStatusItemVisible() {
+        if !statusItem.isVisible {
+            statusLog("status item visibility restored")
+        }
+        statusItem.isVisible = true
+        if statusItem.button?.target == nil {
+            configureStatusButton()
+        }
+    }
+
+    private func setStatusBadge(_ value: String) {
+        currentStatusBadge = value
+        statusItem.isVisible = true
+        statusItem.length = value.isEmpty ? NSStatusItem.squareLength : NSStatusItem.variableLength
+        guard let button = statusItem.button else { return }
+        button.title = value.isEmpty ? "" : " \(value)"
+        button.imagePosition = value.isEmpty ? .imageOnly : .imageLeading
     }
 
     private func showPopover() {
@@ -320,7 +426,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.serviceOnline = false
                 DispatchQueue.main.async {
                     self.controller.setOffline()
-                    self.statusItem.button?.title = " 归档 !"
+                    self.setStatusBadge("!")
                 }
                 return
             }
@@ -337,25 +443,170 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.lastSessionRequestCount = payload.sessionRequests.count
             }
             DispatchQueue.main.async {
+                self.automationPaused = payload.overview.automationPaused
                 self.controller.update(payload)
-                if let job = payload.currentJob {
-                    self.statusItem.button?.title = " 归档 \(job.progress)%"
+                if payload.overview.automationPaused {
+                    self.setStatusBadge("暂停")
+                } else if let job = payload.currentJob {
+                    self.setStatusBadge("\(job.progress)%")
                 } else if payload.attentionCount > 0 {
-                    self.statusItem.button?.title = " 归档 !"
+                    self.setStatusBadge("!")
                 } else if payload.overview.pendingExportCount > 0 {
-                    self.statusItem.button?.title = " 归档 \(payload.overview.pendingExportCount)"
+                    self.setStatusBadge("\(payload.overview.pendingExportCount)")
                 } else {
-                    self.statusItem.button?.title = " 归档"
+                    self.setStatusBadge("")
                 }
-                self.prepareNextSessionIfNeeded(
-                    payload.sessionRequests,
-                    hasCurrentJob: payload.currentJob != nil
-                )
+                self.handleCompletion(payload.latestCompletion)
+                if payload.overview.automationPaused {
+                    self.cancelForegroundSessionPreparation()
+                } else {
+                    self.prepareNextSessionIfNeeded(
+                        payload.sessionRequests,
+                        hasCurrentJob: payload.currentJob != nil
+                    )
+                }
             }
         }.resume()
     }
 
+    private func setAutomationPaused(_ paused: Bool) {
+        automationPaused = paused
+        if paused {
+            cancelForegroundSessionPreparation()
+        }
+        guard let url = URL(string: "http://127.0.0.1:8765/api/automation/control") else {
+            controller.setPauseUpdateFailed()
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try? JSONSerialization.data(withJSONObject: ["paused": paused])
+        URLSession.shared.dataTask(with: request) { [weak self] _, response, error in
+            guard let self else { return }
+            guard error == nil,
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode)
+            else {
+                DispatchQueue.main.async {
+                    self.controller.setPauseUpdateFailed()
+                    self.refresh()
+                }
+                return
+            }
+            DispatchQueue.main.async { self.refresh() }
+        }.resume()
+    }
+
+    private func cancelForegroundSessionPreparation() {
+        guard sessionPreparationInFlight || foregroundSessionProcess != nil else { return }
+        statusLog("automation paused; cancelling foreground recovery")
+        if let process = foregroundSessionProcess, process.isRunning {
+            process.terminate()
+        }
+        foregroundSessionProcess = nil
+        sessionPreparationInFlight = false
+    }
+
+    private func handleCompletion(_ completion: CompletionEvent?) {
+        guard let completion else { return }
+        let defaultsKey = "last-weekly-completion-v1"
+        guard UserDefaults.standard.string(forKey: defaultsKey) != completion.cycleKey else { return }
+        notificationCenter.getNotificationSettings { [weak self] settings in
+            guard let self else { return }
+            switch settings.authorizationStatus {
+            case .authorized, .provisional:
+                self.deliverCompletionNotification(completion, defaultsKey: defaultsKey)
+            case .notDetermined:
+                self.notificationCenter.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+                    if granted {
+                        self.deliverCompletionNotification(completion, defaultsKey: defaultsKey)
+                    } else {
+                        self.showCompletionFallback(completion, defaultsKey: defaultsKey)
+                    }
+                }
+            case .denied:
+                self.showCompletionFallback(completion, defaultsKey: defaultsKey)
+            @unknown default:
+                self.showCompletionFallback(completion, defaultsKey: defaultsKey)
+            }
+        }
+    }
+
+    private func deliverCompletionNotification(_ completion: CompletionEvent, defaultsKey: String) {
+        let content = UNMutableNotificationContent()
+        content.title = "微信公众号每周归档"
+        content.body = "已经弄好了。本周共处理 \(completion.accountCount) 个公众号，新增 \(completion.exportedCount) 篇。点击打开文件夹。"
+        content.sound = .default
+        content.userInfo = [
+            "cycle_key": completion.cycleKey,
+            "output_folder": completion.outputFolder,
+        ]
+        let request = UNNotificationRequest(
+            identifier: "weekly-completion-\(completion.cycleKey)",
+            content: content,
+            trigger: nil
+        )
+        notificationCenter.add(request) { [weak self] error in
+            if let error {
+                statusLog("completion notification failed: \(error.localizedDescription)")
+                self?.showCompletionFallback(completion, defaultsKey: defaultsKey)
+                return
+            }
+            self?.markCompletionHandled(completion.cycleKey, defaultsKey: defaultsKey)
+        }
+    }
+
+    private func showCompletionFallback(_ completion: CompletionEvent, defaultsKey: String) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            guard UserDefaults.standard.string(forKey: defaultsKey) != completion.cycleKey else { return }
+            let alert = NSAlert()
+            alert.messageText = "已经弄好了"
+            alert.informativeText = "本周共处理 \(completion.accountCount) 个公众号，新增 \(completion.exportedCount) 篇。"
+            alert.addButton(withTitle: "打开文件夹")
+            alert.addButton(withTitle: "稍后")
+            NSApp.activate(ignoringOtherApps: true)
+            let response = alert.runModal()
+            self.markCompletionHandled(completion.cycleKey, defaultsKey: defaultsKey)
+            if response == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(
+                    URL(fileURLWithPath: completion.outputFolder, isDirectory: true)
+                )
+            }
+        }
+    }
+
+    private func markCompletionHandled(_ cycleKey: String, defaultsKey: String) {
+        UserDefaults.standard.set(cycleKey, forKey: defaultsKey)
+        UserDefaults.standard.synchronize()
+        statusLog("weekly completion handled: \(cycleKey)")
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        defer { completionHandler() }
+        guard response.actionIdentifier == UNNotificationDefaultActionIdentifier,
+              let path = response.notification.request.content.userInfo["output_folder"] as? String
+        else { return }
+        DispatchQueue.main.async {
+            NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+        }
+    }
+
     private func prepareNextSessionIfNeeded(_ requests: [SessionRequest], hasCurrentJob: Bool) {
+        guard !automationPaused else { return }
         guard !sessionPreparationInFlight else { return }
         guard !hasCurrentJob else { return }
         if isScreenLocked() {
@@ -367,28 +618,67 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         lastScreenLocked = false
         let day = ISO8601DateFormatter().string(from: Date()).prefix(10)
         guard let request = requests.first(where: {
-            !UserDefaults.standard.bool(forKey: "foreground-session-v3:\(day):\($0.subscriptionId)")
+            sessionPreparationAllowed(day: day, subscriptionId: $0.subscriptionId)
         }) else { return }
 
         sessionPreparationInFlight = true
-        statusLog("starting authorized foreground recovery for \(request.accountName)")
-        startForegroundSubscription(request.accountBiz) { [weak self] accepted in
+        let attempt = recordSessionPreparationAttempt(
+            day: day,
+            subscriptionId: request.subscriptionId
+        )
+        statusLog(
+            "starting authorized foreground recovery for \(request.accountName) " +
+            "(attempt \(attempt)/\(maxSessionPreparationAttempts))"
+        )
+        startForegroundSessionPreparation(request.accountBiz) { [weak self] prepared in
             guard let self else { return }
-            if accepted {
-                UserDefaults.standard.set(
-                    true,
-                    forKey: "foreground-session-v3:\(day):\(request.subscriptionId)"
+            guard prepared else {
+                statusLog(
+                    "account \(request.accountName) foreground preparation did not complete " +
+                    "(attempt \(attempt)/\(self.maxSessionPreparationAttempts))"
                 )
-                UserDefaults.standard.synchronize()
-                statusLog("account \(request.accountName) foreground recovery finished")
-            } else {
-                statusLog("account \(request.accountName) foreground recovery failed to start or finish")
+                DispatchQueue.main.async {
+                    self.sessionPreparationInFlight = false
+                    self.refresh()
+                }
+                return
             }
-            DispatchQueue.main.async {
-                self.sessionPreparationInFlight = false
-                self.refresh()
+            statusLog("account \(request.accountName) public seed opened; requesting background resume")
+            self.resumeSubscriptionAfterSession(request.subscriptionId) { accepted in
+                statusLog(
+                    accepted
+                        ? "account \(request.accountName) background resume accepted"
+                        : "account \(request.accountName) background resume request failed"
+                )
+                DispatchQueue.main.async {
+                    self.sessionPreparationInFlight = false
+                    self.refresh()
+                }
             }
         }
+    }
+
+    private func sessionPreparationAllowed(day: Substring, subscriptionId: Int) -> Bool {
+        let defaults = UserDefaults.standard
+        let attemptsKey = "foreground-session-v6-attempts:\(day):\(subscriptionId)"
+        let attempts = defaults.integer(forKey: attemptsKey)
+        if attempts >= maxSessionPreparationAttempts { return false }
+        let lastKey = "foreground-session-v6-last:\(day):\(subscriptionId)"
+        let lastAttempt = defaults.double(forKey: lastKey)
+        return lastAttempt <= 0 || Date().timeIntervalSince1970 - lastAttempt >= sessionPreparationCooldown
+    }
+
+    private func recordSessionPreparationAttempt(day: Substring, subscriptionId: Int) -> Int {
+        let defaults = UserDefaults.standard
+        let attemptsKey = "foreground-session-v6-attempts:\(day):\(subscriptionId)"
+        let nextAttempt = defaults.integer(forKey: attemptsKey) + 1
+        defaults.set(nextAttempt, forKey: attemptsKey)
+        defaults.set(
+            Date().timeIntervalSince1970,
+            forKey: "foreground-session-v6-last:\(day):\(subscriptionId)"
+        )
+        defaults.synchronize()
+        return nextAttempt
     }
 
     private func isScreenLocked() -> Bool {
@@ -396,7 +686,10 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         return values["CGSSessionScreenIsLocked"] as? Bool ?? false
     }
 
-    private func startForegroundSubscription(_ accountBiz: String, completion: @escaping (Bool) -> Void) {
+    private func startForegroundSessionPreparation(
+        _ accountBiz: String,
+        completion: @escaping (Bool) -> Void
+    ) {
         let productRoot = Bundle.main.bundleURL.deletingLastPathComponent()
         let runtime = productRoot.appendingPathComponent("runtime", isDirectory: true)
         let python = runtime.appendingPathComponent(".venv/bin/python")
@@ -414,24 +707,56 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         process.arguments = [
             main.path,
             "--config", config.path,
-            "automation-run",
+            "automation-prepare-session",
             "--account-biz", accountBiz,
         ]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.standardError
         process.terminationHandler = { task in
             statusLog("foreground recovery process exited with status \(task.terminationStatus)")
-            // A non-zero CLI status means the public session is still
-            // unavailable, not that the foreground helper failed to launch.
-            // Record the attempt so the menu item does not retry every poll.
-            completion(true)
+            DispatchQueue.main.async { [weak self, weak process] in
+                guard let self, let process else { return }
+                if self.foregroundSessionProcess === process {
+                    self.foregroundSessionProcess = nil
+                }
+            }
+            completion(task.terminationStatus == 0)
         }
+        foregroundSessionProcess = process
         do {
             try process.run()
         } catch {
+            foregroundSessionProcess = nil
             statusLog("foreground recovery launch error: \(error.localizedDescription)")
             completion(false)
         }
+    }
+
+    private func resumeSubscriptionAfterSession(
+        _ subscriptionId: Int,
+        completion: @escaping (Bool) -> Void
+    ) {
+        guard let url = URL(
+            string: "http://127.0.0.1:8765/api/automation/subscriptions/" +
+                "\(subscriptionId)/resume-after-session"
+        ) else {
+            completion(false)
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        URLSession.shared.dataTask(with: request) { _, response, error in
+            guard error == nil,
+                  let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode)
+            else {
+                completion(false)
+                return
+            }
+            completion(true)
+        }.resume()
     }
 }
 

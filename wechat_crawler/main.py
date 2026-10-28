@@ -71,7 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "automation": {
         "enabled": True,
         "weekday": 6,
-        "hour": 20,
+        "hour": 21,
         "minute": 0,
         "check_interval_seconds": 60,
     },
@@ -87,6 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     setup_logging(args.verbose)
     config = load_config(args.config)
+    if args.command == "cache-update":
+        from .cache_update import command
+        return command(args, config)
+    if args.command == "weekly-run":
+        return cmd_weekly_run(args, config)
     storage = Storage(config["database"]["path"])
     storage.init_db()
 
@@ -112,10 +117,14 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_web(args, config, storage)
     if args.command == "automation-adopt-existing":
         return cmd_automation_adopt_existing(config, storage)
+    if args.command == "automation-activate-current-baseline":
+        return cmd_automation_activate_current_baseline(config, storage)
     if args.command == "automation-status":
         return cmd_automation_status(storage)
     if args.command == "automation-run":
         return cmd_automation_run(args, config, storage)
+    if args.command == "automation-prepare-session":
+        return cmd_automation_prepare_session(args, config, storage)
     if args.command == "automation-export-pending":
         return cmd_automation_export_pending(args, config, storage)
     if args.command == "automation-cleanup":
@@ -171,8 +180,8 @@ def build_parser() -> argparse.ArgumentParser:
     crawl.add_argument("--workers", type=int, default=1, help="Number of concurrent fetch workers for fast first-pass crawling.")
 
     history = sub.add_parser("history-sync", help="Discover article URLs through the visible WeChat account history session.")
-    history.add_argument("--biz", required=True, help="Target account biz, for example MzExampleAccount==.")
-    history.add_argument("--wechat-id", required=True, help="Target WeChat ID, for example gh_example_account.")
+    history.add_argument("--biz", required=True, help="Target account biz, for example MzA3OTQzNjk1MA==.")
+    history.add_argument("--wechat-id", required=True, help="Target WeChat ID, for example gh_69e1edf8c365.")
     history.add_argument("--account-name", required=True, help="Human-readable account name.")
     add_history_options(history)
     history.add_argument("--crawl", action="store_true", help="Crawl discovered URLs after discovery.")
@@ -183,7 +192,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Import articles from the visible WeChat account history content-flow cache.",
     )
     cache_history.add_argument("--biz", required=True, help="Target account biz.")
-    cache_history.add_argument("--wechat-id", required=True, help="Target WeChat ID, for example gh_example_account.")
+    cache_history.add_argument("--wechat-id", required=True, help="Target WeChat ID, for example gh_69e1edf8c365.")
     cache_history.add_argument("--account-name", required=True, help="Human-readable account name.")
     cache_history.add_argument(
         "--app-data-dir",
@@ -233,10 +242,46 @@ def build_parser() -> argparse.ArgumentParser:
         "automation-adopt-existing",
         help="Adopt current account articles as the no-repeat automation baseline.",
     )
+    sub.add_parser(
+        "automation-activate-current-baseline",
+        help="Use every currently imported article as the baseline and enable weekly automation.",
+    )
     sub.add_parser("automation-status", help="Print persistent subscription and weekly job status.")
 
     automation_run = sub.add_parser("automation-run", help="Run one or all subscriptions immediately.")
     automation_run.add_argument("--account-biz", help="Run only the exact account biz; default runs all enabled accounts.")
+    automation_run.add_argument(
+        "--resume-needs-session",
+        action="store_true",
+        help="Resume the current scheduled job instead of creating a separate manual cycle.",
+    )
+
+    cache = sub.add_parser("cache-update", help="Passive retained cache → de-duplication → discovered Word; default is read-only.")
+    from .cache_update import add_arguments
+    add_arguments(cache)
+
+    passive = sub.add_parser("weekly-run", help="Experimental bound biz-push increment; no automatic setup. For retained cache use cache-update.")
+    passive.add_argument("--until", help="Inclusive publication end date; default today.")
+    passive.add_argument("--account-biz", help="Limit to one exact enabled subscription.")
+    checks = passive.add_mutually_exclusive_group()
+    checks.add_argument("--plan-only", action="store_true", help="Read product boundaries only; no WeChat/helper/network/writes.")
+    checks.add_argument("--check", action="store_true", help="Read-only helper/coverage health check; no public requests or Word.")
+    passive.add_argument("--allow-partial", action="store_true", help="Explicitly export available bodies without advancing incomplete checkpoints.")
+    passive.add_argument("--search-gaps", action="store_true", default=True, help="One ordinary PC query/account (default); never proves completeness.")
+    passive.add_argument("--no-search", dest="search_gaps", action="store_false", help="Skip optional PC cross-check for this run.")
+    passive.add_argument("--require-complete", action="store_true", help="Keep strict full-publication acceptance; otherwise export explicitly labelled observed increments.")
+    passive.add_argument("--source", choices=("auto", "cache", "biz"), default="auto",
+                         help="auto (default): bound biz DB or one setup notice; cache: explicit manual-refresh fallback; never automatic setup.")
+
+    automation_prepare = sub.add_parser(
+        "automation-prepare-session",
+        help="Open one saved public seed in visible WeChat without reading WeChat app data.",
+    )
+    automation_prepare.add_argument(
+        "--account-biz",
+        required=True,
+        help="Exact account biz whose saved public seed should be opened.",
+    )
 
     automation_export = sub.add_parser(
         "automation-export-pending",
@@ -297,6 +342,30 @@ def load_config(path: str | Path) -> dict[str, Any]:
         if value:
             config[section]["path"] = str(Path(os.path.expandvars(str(value))).expanduser())
     return config
+
+
+def cmd_weekly_run(args, config):
+    from datetime import datetime
+    from .passive_weekly import PassiveWeeklyRunner
+    from .weekly_source_router import WeeklySourceRouter, public_source_health
+
+    settings = config.get("passive_weekly", {})
+    mode = getattr(args, "source", "auto")
+    runner = PassiveWeeklyRunner(config["database"]["path"], config["output"]["path"], settings,
+                                 sources=WeeklySourceRouter(settings, mode))
+    until = args.until or datetime.now().astimezone().date().isoformat()
+    try:
+        if args.plan_only or args.check:
+            result = runner.inspect(until, biz=args.account_biz, source_check=args.check)
+        else:
+            result = runner.run(until, biz=args.account_biz, allow_partial=args.allow_partial,
+                                search_gaps=args.search_gaps, observed=not args.require_complete)
+    except Exception:
+        result = {"status": "blocked", "reason": "weekly_pipeline_local_check_failed"}
+    public_source_health(result, mode)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["status"] in ("plan_only", "completed", "observed_completed") or (
+        result["status"] == "health_checked" and result.get("source_status") == "read") else 2
 
 
 def cmd_discover(args: argparse.Namespace, config: dict[str, Any], storage: Storage) -> int:
@@ -1090,10 +1159,39 @@ def cmd_automation_adopt_existing(config: dict[str, Any], storage: Storage) -> i
     automation.init_db()
     adopted = automation.adopt_existing_accounts(
         schedule_weekday=int(automation_cfg.get("weekday", 6)),
-        schedule_hour=int(automation_cfg.get("hour", 20)),
+        schedule_hour=int(automation_cfg.get("hour", 21)),
         schedule_minute=int(automation_cfg.get("minute", 0)),
     )
     print(json.dumps({"adopted": len(adopted), "subscription_ids": adopted}, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_automation_activate_current_baseline(
+    config: dict[str, Any],
+    storage: Storage,
+) -> int:
+    from .automation_store import AutomationStore
+
+    automation_cfg = config.get("automation", {})
+    automation = AutomationStore(storage)
+    automation.init_db()
+    activated = automation.activate_current_baseline(
+        schedule_weekday=int(automation_cfg.get("weekday", 6)),
+        schedule_hour=int(automation_cfg.get("hour", 21)),
+        schedule_minute=int(automation_cfg.get("minute", 0)),
+        enabled=True,
+    )
+    print(
+        json.dumps(
+            {
+                "activated": len(activated),
+                "baseline_articles": sum(row["baseline_article_count"] for row in activated),
+                "subscriptions": activated,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -1114,12 +1212,27 @@ def cmd_automation_status(storage: Storage) -> int:
             "latest_publish_time": row["latest_publish_time"],
             "last_success_at": row["last_success_at"],
             "next_run_at": row["next_run_at"],
+            "schedule_weekday": int(row["schedule_weekday"]),
+            "schedule_hour": int(row["schedule_hour"]),
+            "schedule_minute": int(row["schedule_minute"]),
             "state": row["state"],
         }
         for row in automation.list_subscriptions()
     ]
     jobs = [dict(row) for row in automation.list_jobs(limit=20)]
-    print(json.dumps({"database": str(storage.db_path.resolve()), "subscriptions": subscriptions, "jobs": jobs}, ensure_ascii=False, indent=2))
+    latest_completion = automation.latest_completed_cycle()
+    print(
+        json.dumps(
+            {
+                "database": str(storage.db_path.resolve()),
+                "subscriptions": subscriptions,
+                "latest_completion": dict(latest_completion) if latest_completion else None,
+                "jobs": jobs,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -1129,12 +1242,16 @@ def cmd_automation_run(args: argparse.Namespace, config: dict[str, Any], storage
 
     automation = AutomationStore(storage)
     automation.init_db()
+    if automation.is_automation_paused():
+        print("全部爬取已暂停；请先在菜单栏插件中点击“继续”")
+        return 3
     automation_cfg = config.get("automation", {})
-    automation.adopt_existing_accounts(
-        schedule_weekday=int(automation_cfg.get("weekday", 6)),
-        schedule_hour=int(automation_cfg.get("hour", 20)),
-        schedule_minute=int(automation_cfg.get("minute", 0)),
-    )
+    if not automation.has_subscriptions():
+        automation.adopt_existing_accounts(
+            schedule_weekday=int(automation_cfg.get("weekday", 6)),
+            schedule_hour=int(automation_cfg.get("hour", 21)),
+            schedule_minute=int(automation_cfg.get("minute", 0)),
+        )
     subscriptions = automation.list_subscriptions()
     if args.account_biz:
         subscriptions = [row for row in subscriptions if row["biz"] == args.account_biz]
@@ -1144,9 +1261,63 @@ def cmd_automation_run(args: argparse.Namespace, config: dict[str, Any], storage
     else:
         subscriptions = [row for row in subscriptions if int(row["enabled"])]
     runner = WeeklySyncRunner(storage, config.get("output", {}).get("path", "output"), config)
-    results = [runner.run_subscription_now(int(row["id"])).to_dict() for row in subscriptions]
+    run_one = runner.resume_latest_scheduled if args.resume_needs_session else runner.run_subscription_now
+    results = [run_one(int(row["id"])).to_dict() for row in subscriptions]
     print(json.dumps(results, ensure_ascii=False, indent=2))
     return 0 if all(row["status"] == "completed" for row in results) else 2
+
+
+def cmd_automation_prepare_session(
+    args: argparse.Namespace,
+    config: dict[str, Any],
+    storage: Storage,
+) -> int:
+    """Resume one waiting job through the project's normal direct-first path.
+
+    ``WeeklySyncRunner`` already owns the complete recovery contract: retry the
+    saved exact-biz session first, open the saved seed once only on
+    ``needs_session``, then retry the same scheduled job. Keep this command as a
+    thin foreground entrypoint so the status App does not duplicate that logic.
+    """
+    from .automation_store import AutomationStore
+    from .weekly_sync import WeeklySyncRunner
+
+    automation = AutomationStore(storage)
+    automation.init_db()
+    if automation.is_automation_paused():
+        print("全部爬取已暂停；不会打开或操作微信")
+        return 3
+    subscription = next(
+        (row for row in automation.list_subscriptions() if row["biz"] == args.account_biz),
+        None,
+    )
+    if subscription is None:
+        print(f"subscription not found for biz={args.account_biz}")
+        return 2
+    waiting_job = automation.latest_resumable_job(int(subscription["id"]))
+    if waiting_job is None or waiting_job["status"] not in ("needs_session", "failed"):
+        print(
+            json.dumps(
+                {
+                    "account_name": subscription["account_name"],
+                    "status": "no_waiting_job",
+                    "message": "当前没有等待微信会话的计划任务",
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    resume_config = json.loads(json.dumps(config))
+    resume_config.setdefault("automation", {})["prepare_wechat_session"] = True
+    result = WeeklySyncRunner(
+        storage,
+        resume_config.get("output", {}).get("path", "output"),
+        resume_config,
+    ).resume_latest_scheduled(int(subscription["id"]))
+    print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    return 0 if result.status == "completed" else 2
 
 
 def cmd_automation_export_pending(
