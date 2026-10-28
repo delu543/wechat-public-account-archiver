@@ -23,6 +23,9 @@
 .venv/bin/python main.py cache-update --export --accept-discovered
 
 # 缺少当前数据时：先启动有限收集，再由用户正常浏览所需主页
+.venv/bin/python main.py cache-update --collect --seconds 1
+# 先试读一次当前公开缓存并复查；已有所需数据时跳过人工浏览
+# 确需人工加载时才开启持续累计：
 .venv/bin/python main.py cache-update --collect --seconds 600
 
 # 收集后立即准备 Word；只有本次独立收集已获准时才加暂停例外
